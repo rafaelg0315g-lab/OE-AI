@@ -13,19 +13,7 @@ const SUPPORTED_SIZES = ['1024x1024', '768x1344', '864x1152', '1344x768', '1152x
 
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024 // 6 MB tras decodificar
 
-/** Detecta el MIME real desde los magic bytes (el proveedor puede devolver JPEG). */
-function sniffImageMime(buffer: Buffer): string {
-  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
-    return 'image/png'
-  }
-  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
-    return 'image/jpeg'
-  }
-  if (buffer.length >= 12 && buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP') {
-    return 'image/webp'
-  }
-  return 'image/png'
-}
+// sniffImageMime se importa de '@/lib/ai/gemini-direct' (detección por magic bytes).
 
 const ImageEditBodySchema = z.object({
   // Data URL de la imagen a editar (PNG/JPEG/WebP, ≤6 MB decodificados).
