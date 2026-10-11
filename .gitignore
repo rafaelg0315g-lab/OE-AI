@@ -63,3 +63,4 @@ db/*.sqlite3
 tool-results/
 # ...pero la plantilla de variables SÍ va al repo
 !.env.example
+upload/
