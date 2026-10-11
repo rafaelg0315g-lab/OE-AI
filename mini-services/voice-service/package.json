@@ -1,0 +1,14 @@
+{
+  "name": "oe-voice-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Servicio de voz en tiempo real de OE AI LLM: streaming de micrófono por WebSocket, VAD, ASR, chat LLM y TTS en streaming.",
+  "scripts": {
+    "dev": "bun --hot index.ts",
+    "start": "bun index.ts"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.1",
+    "z-ai-web-dev-sdk": "^0.0.18"
+  }
+}

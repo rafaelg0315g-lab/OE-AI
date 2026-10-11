@@ -1,0 +1,198 @@
+/**
+ * Generador del archivo de datos fuente del catálogo OE AI.
+ * - Toma la lista de 128 identificadores aportada por el usuario (material fuente).
+ * - Deduplica (conservando el primer orden de aparición) y valida el conteo.
+ * - Emite src/lib/ai/catalog/models.data.ts con los IDs EXACTOS, sin alterar
+ *   mayúsculas, números, puntos, guiones ni sufijos.
+ *
+ * Este script es una utilidad de desarrollo; el archivo emitido es la fuente
+ * versionada del catálogo. Si cambia la lista, editar aquí y re-ejecutar.
+ */
+import { writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const RAW_IDS: string[] = [
+  'Qwen/Qwen3.8-27B',
+  'deepseek-ai/DeepSeek-V4.1-Flash',
+  'zai-org/GLM-5.3-Flash',
+  'zai-org/GLM-5.3',
+  'meta-llama/Llama-3.1-8B-Instruct',
+  'moonshotai/Kimi-K3',
+  'XiaomiMiMo/MiMo-V2.6-Pro-RL',
+  'google/gemma-4-31B-it',
+  'Qwen/Qwen3.5-9B',
+  'Qwen/Qwen3.6-35B-A3B',
+  'google/gemma-4-26B-A4B-it',
+  'openai/gpt-oss-20b',
+  'deepseek-ai/DeepSeek-R1',
+  'meta-models/Muse-Glimmer-30B',
+  'openai/gpt-oss-120b',
+  'deepseek-ai/DeepSeek-V4-Pro',
+  'XiaomiMiMo/MiMo-V2.6-Flash-RL',
+  'meta-llama/Llama-3.3-70B-Instruct',
+  'Qwen/Qwen3.8-2.4T-A95B',
+  'deepseek-ai/DeepSeek-V4-Flash-0731',
+  'google/gemma-3-4b-it',
+  'prism-ml/Ternary-Bonsai-27B-gguf',
+  'thinkingmachines/Inkling',
+  'inclusionAI/Ling-3.0-flash-Fin',
+  'deepseek-ai/DeepSeek-V4-Pro-0813',
+  'Qwen/Qwen3-8B',
+  'MiniMaxAI/MiniMax-M3',
+  'zai-org/GLM-5.2',
+  'Qwen/Qwen2.5-Coder-32B-Instruct',
+  'inclusionAI/Ling-3.0-flash',
+  'google/gemma-3-12b-it',
+  'Qwen/Qwen3-Coder-30B-A3B-Instruct',
+  'speakleash/Bielik-11B-v3.0-Instruct',
+  'meta-llama/Llama-4-Scout-17B-16E-Instruct',
+  'Qwen/Qwen3.5-35B-A3B',
+  'zai-org/GLM-4.7-Flash',
+  'inclusionAI/Ling-3.0-flash-VL',
+  'deepseek-ai/DeepSeek-R1-0528',
+  'moonshotai/Kimi-K2.7-Code',
+  'deepseek-ai/DeepSeek-V4-Flash-Vision-Exp',
+  'Qwen/Qwen2.5-Coder-7B-Instruct',
+  'Qwen/Qwen3-4B-Instruct-2507',
+  'Qwen/Qwen3-30B-A3B',
+  'tencent/Hy3',
+  'XiaomiMiMo/MiMo-V2.5-Pro',
+  'CohereLabs/tiny-aya-global',
+  'Qwen/Qwen3.5-397B-A17B',
+  'Sao10K/L3-8B-Stheno-v3.2',
+  'deepseek-ai/DeepSeek-V3-0324',
+  'Qwen/Qwen3-14B',
+  'nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16',
+  'Qwen/Qwen3.6-27B',
+  'tencent/Hy4-preview',
+  'ibm-granite/granite-4.2-3b',
+  'moonshotai/Kimi-K2.6',
+  'Qwen/Qwen3.5-122B-A10B',
+  'zai-org/GLM-4.5-Air',
+  'XiaomiMiMo/MiMo-V2.5',
+  'deepseek-ai/DeepSeek-R1-Distill-Qwen-14B',
+  'Qwen/Qwen2.5-Coder-3B-Instruct',
+  'deepseek-ai/DeepSeek-R1-Distill-Llama-8B',
+  'Qwen/Qwen3.5-27B',
+  'thinkingmachines/Inkling-Small',
+  'deepseek-ai/DeepSeek-V3.2',
+  'ibm-granite/granite-4.2-8b',
+  'ibm-granite/granite-4.2-30b',
+  'Qwen/Qwen2.5-72B-Instruct',
+  'microsoft/phi-4',
+  'Qwen/Qwen3-Next-80B-A3B-Instruct',
+  'nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16',
+  'nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4',
+  'meta-llama/Llama-Guard-4-12B',
+  'MiniMaxAI/MiniMax-M2.7',
+  'Qwen/Qwen3-32B',
+  'deepseek-ai/DeepSeek-V3.1-Terminus',
+  'meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8',
+  'Qwen/Qwen3-235B-A22B-Instruct-2507',
+  'stepfun-ai/Step-3.7-Flash',
+  'zai-org/GLM-5.1',
+  'deepseek-ai/DeepSeek-V3',
+  'CohereLabs/tiny-aya-water',
+  'zai-org/GLM-5',
+  'zai-org/GLM-5.3-Flash-BF16',
+  'CohereLabs/c4ai-command-r7b-12-2024',
+  'CohereLabs/c4ai-command-a-03-2025',
+  'CohereLabs/command-a-reasoning-08-2025',
+  'CohereLabs/tiny-aya-fire',
+  'NousResearch/Hermes-3-Llama-3.1-70B',
+  'Qwen/Qwen3-VL-235B-A22B-Instruct',
+  'google/gemma-3-27b-it',
+  'moonshotai/Kimi-K2-Instruct-0905',
+  'alpindale/WizardLM-2-8x22B',
+  'openai/gpt-oss-safeguard-20b',
+  'MiniMaxAI/MiniMax-M2.5',
+  'mistralai/Mixtral-8x22B-Instruct-v0.1',
+  'deepseek-ai/DeepSeek-R1-Distill-Qwen-7B',
+  'MiniMaxAI/MiniMax-M1-80k',
+  'CohereLabs/aya-vision-32b',
+  'CohereLabs/c4ai-command-r7b-arabic-02-2025',
+  'CohereLabs/aya-expanse-32b',
+  'CohereLabs/c4ai-command-r-08-2024',
+  'CohereLabs/command-a-translate-08-2025',
+  'CohereLabs/tiny-aya-earth',
+  'Qwen/Qwen3-235B-A22B',
+  'zai-org/GLM-5.3-BF16',
+  'zai-org/GLM-5.2-FP8',
+  'zai-org/GLM-4.5',
+  'zai-org/GLM-4.5V',
+  'zai-org/GLM-4.6',
+  'zai-org/GLM-4.6-FP8',
+  'zai-org/GLM-4.5V-FP8',
+  'zai-org/GLM-4.6V',
+  'zai-org/GLM-4.6V-FP8',
+  'zai-org/GLM-4.7-FP8',
+  'swiss-ai/Apertus-8B-Instruct-2509',
+  'Qwen/Qwen3-4B-Thinking-2507',
+  'zai-org/GLM-4.7',
+  'moonshotai/Kimi-K2.5',
+  'deepseek-ai/DeepSeek-V3.1',
+  'aisingapore/Qwen-SEA-LION-v4-32B-IT',
+  'aisingapore/Gemma-SEA-LION-v4-27B-IT',
+  'stepfun-ai/Step-3.5-Flash',
+  'Qwen/Qwen2.5-VL-72B-Instruct',
+  'zai-org/AutoGLM-Phone-9B-Multilingual',
+  'zai-org/GLM-4.6V-Flash',
+  'Qwen/Qwen3-VL-30B-A3B-Instruct',
+  'moonshotai/Kimi-K2-Instruct',
+  'prism-ml/Ternary-Bonsai-27B-AWQ-4bit',
+]
+
+// --- Deduplicación y validación ---
+const seen = new Set<string>()
+const unique: string[] = []
+const duplicates: string[] = []
+for (const id of RAW_IDS) {
+  if (seen.has(id)) {
+    duplicates.push(id)
+  } else {
+    seen.add(id)
+    unique.push(id)
+  }
+}
+
+console.log(`Total en la lista fuente: ${RAW_IDS.length}`)
+console.log(`Identificadores únicos:   ${unique.length}`)
+if (duplicates.length > 0) {
+  console.log(`Duplicados eliminados (${duplicates.length}):`)
+  for (const d of duplicates) console.log(`  - ${d}`)
+}
+if (unique.length !== 128) {
+  console.warn(`AVISO: se esperaban 128 únicos y hay ${unique.length}. Revisar antes de emitir.`)
+}
+
+const fileBody = `/**
+ * DATOS FUENTE DEL CATÁLOGO OE AI — lista inicial de identificadores de modelos.
+ *
+ * PROCEDENCIA: identificadores extraídos del archivo aportado por el propietario
+ * del producto (material fuente de OE BUSINESS). Conservados EXACTAMENTE como se
+ * recibieron (mayúsculas, números, puntos, guiones y sufijos), tras deduplicación.
+ *
+ * AVISO DE VERIFICACIÓN (no eliminar):
+ * - Que un identificador aparezca aquí NO implica credenciales, acceso contratado,
+ *   disponibilidad vigente ni integración completada.
+ * - La disponibilidad real se determina con la configuración de proveedores y las
+ *   comprobaciones registradas en la base de datos (tabla ProviderCheck).
+ * - Si se descubre que un ID no existe, está mal escrito o ya no está disponible,
+ *   NO eliminarlo silenciosamente: marcar su estado y dejar una nota de revisión
+ *   en src/lib/ai/catalog/catalog.ts (CATALOG_REVIEW_NOTES).
+ *
+ * Fecha de incorporación: 2025 (fase 1 del catálogo OE AI).
+ */
+
+export const CATALOG_SOURCE_NOTE =
+  'Lista inicial de 128 identificadores de modelos extraída del material fuente de OE BUSINESS. Los estados de integración se calculan dinámicamente a partir de la configuración real y de comprobaciones verificadas; la lista es un punto de partida, no una garantía de disponibilidad.'
+
+export const SOURCE_MODEL_IDS: readonly string[] = [
+${unique.map((id) => `  '${id}',`).join('\n')}
+]
+`
+
+const outPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'lib', 'ai', 'catalog', 'models.data.ts')
+writeFileSync(outPath, fileBody, 'utf8')
+console.log(`Emitido: ${outPath}`)

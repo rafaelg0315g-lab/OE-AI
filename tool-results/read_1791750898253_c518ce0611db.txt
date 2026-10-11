@@ -1,0 +1,576 @@
+     1→     1→/**
+     2→     2→ * OE AI Web Factory — Pipeline de composición y generación (servidor únicamente).
+     3→     3→ *
+     4→     4→ * Flujo por solicitud:
+     5→     5→ *   1. Plan CONTRATO con referencias del catálogo (planificador → JSON): tipo de
+     6→     6→ *      sitio, estética, sistema de diseño (paleta/tipografía/radios/motion),
+     7→     7→ *      páginas y secciones coherentes, interacciones e imágenes necesarias.
+     8→     8→ *   2. Shell compartido (una llamada): styles.css con variables del sistema de
+     9→     9→ *      diseño + convenciones de clases .wf-* + app.js (menú móvil, reveal al
+    10→    10→ *      scroll con prefers-reduced-motion, formularios reales, año del footer).
+    11→    11→ *   3. Páginas en PARALELO (máx 4): cada HTML usa SOLAMENTE el shell .wf-*
+    12→    12→ *      (coherencia de un único producto).
+    13→    13→ *   4. Imágenes: hasta 2 generadas con el proveedor configurado (best-effort);
+    14→    14→ *      las que fallen quedan como degradado elegante, sin enlaces rotos.
+    15→    15→ *   5. Validación estática honesta (validate.ts) + README con procedencia,
+    16→    16→ *      licencias y cómo ejecutar.
+    17→    17→ *   6. Persistencia en BuildProject/BuildFile → descargable (ZIP) y con vista
+    18→    18→ *      previa real vía /api/web-factory/preview/[id]/.
+    19→    19→ *
+    20→    20→ * Modificación: "update" reescribe SOLO los archivos afectados con el contexto
+    21→    21→ * del proyecto existente.
+    22→    22→ *
+    23→    23→ * Reutilización responsable: el código SIEMPRE es propio (lo escribe el modelo
+    24→    24→ * a partir de patrones); los repos del catálogo son referencia visual y su
+    25→    25→ * licencia queda registrada en la procedencia del proyecto.
+    26→    26→ */
+    27→    27→import { buildChatJson } from '@/lib/build/llm'
+    28→    28→import { db } from '@/lib/db'
+    29→    29→import { guessCategory, listComponentKinds, pickReferences, type CatalogTemplate } from './catalog'
+    30→    30→import { validateSite, type FactoryCheck } from './validate'
+    31→    31→import { languageFromPath } from '@/lib/build/types'
+    32→    32→
+    33→    33→export class WebFactoryError extends Error {
+    34→    34→  errorType: 'rate_limited' | 'empty_response' | 'json_parse' | 'provider_error' | 'invalid_plan' | 'no_files' | 'aborted'
+    35→    35→  constructor(message: string, errorType: WebFactoryError['errorType']) {
+    36→    36→    super(message)
+    37→    37→    this.errorType = errorType
+    38→    38→  }
+    39→    39→}
+    40→    40→
+    41→    41→const MAX_PAGES = 4
+    42→    42→const MAX_FILES = 14
+    43→    43→
+    44→    44→interface DesignSystem {
+    45→    45→  paletteName?: unknown
+    46→    46→  bg?: unknown
+    47→    47→  surface?: unknown
+    48→    48→  text?: unknown
+    49→    49→  muted?: unknown
+    50→    50→  primary?: unknown
+    51→    51→  accent?: unknown
+    52→    52→  radius?: unknown
+    53→    53→  shadow?: unknown
+    54→    54→  headingFont?: unknown
+    55→    55→  bodyFont?: unknown
+    56→    56→  motion?: unknown
+    57→    57→}
+    58→    58→
+    59→    59→interface RawPlan {
+    60→    60→  title?: unknown
+    61→    61→  summary?: unknown
+    62→    62→  siteType?: unknown
+    63→    63→  aesthetic?: unknown
+    64→    64→  designSystem?: DesignSystem
+    65→    65→  pages?: unknown
+    66→    66→  interactions?: unknown
+    67→    67→  images?: unknown
+    68→    68→  references?: unknown
+    69→    69→}
+    70→    70→
+    71→    71→export interface FactoryPage {
+    72→    72→  path: string
+    73→    73→  title: string
+    74→    74→  sections: string[]
+    75→    75→}
+    76→    76→
+    77→    77→export interface FactoryPlan {
+    78→    78→  title: string
+    79→    79→  summary: string
+    80→    80→  siteType: string
+    81→    81→  aesthetic: string
+    82→    82→  designSystem: Record<string, string>
+    83→    83→  pages: FactoryPage[]
+    84→    84→  interactions: string[]
+    85→    85→  images: Array<{ slot: string; prompt: string; size: string }>
+    86→    86→  references: Array<{ name: string; repoUrl: string; license: string; usage: string }>
+    87→    87→}
+    88→    88→
+    89→    89→export interface FactoryResult {
+    90→    90→  id: string
+    91→    91→  title: string
+    92→    92→  summary: string
+    93→    93→  mode: 'web'
+    94→    94→  isUpdate: boolean
+    95→    95→  changedPaths: string[]
+    96→    96→  files: Array<{ path: string; language: string; bytes: number }>
+    97→    97→  designSystem: Record<string, string>
+    98→    98→  references: FactoryPlan['references']
+    99→    99→  checks: FactoryCheck[]
+   100→   100→  warnings: string[]
+   101→   101→  images: Array<{ slot: string; assetId: string; url: string }>
+   102→   102→  previewUrl: string
+   103→   103→  latencyMs: number
+   104→   104→}
+   105→   105→
+   106→   106→function s(v: unknown, fallback: string, max = 120): string {
+   107→   107→  const str = typeof v === 'string' && v.trim() ? v.trim() : fallback
+   108→   108→  return str.slice(0, max)
+   109→   109→}
+   110→   110→
+   111→   111→function sanitizePagePath(raw: unknown): string | null {
+   112→   112→  const p = s(raw, '', 60).toLowerCase().replace(/\\/g, '/').replace(/^\.?\//, '')
+   113→   113→  if (!p || !/^[\w-]+\.html$/.test(p) || p.includes('..')) return null
+   114→   114→  return p
+   115→   115→}
+   116→   116→
+   117→   117→function parsePlan(data: RawPlan, fallbackRefs: CatalogTemplate[]): FactoryPlan {
+   118→   118→  const title = s(data.title, 'Sitio Web', 60)
+   119→   119→  const summary = s(data.summary, '', 400)
+   120→   120→
+   121→   121→  const rawPages = Array.isArray(data.pages) ? data.pages : []
+   122→   122→  const pages: FactoryPage[] = []
+   123→   123→  for (const item of rawPages) {
+   124→   124→    if (!item || typeof item !== 'object') continue
+   125→   125→    const rec = item as { path?: unknown; title?: unknown; sections?: unknown }
+   126→   126→    const path = sanitizePagePath(rec.path)
+   127→   127→    if (!path) continue
+   128→   128→    const sections = Array.isArray(rec.sections)
+   129→   129→      ? rec.sections.map((x) => s(x, 'sección', 80)).slice(0, 8)
+   130→   130→      : []
+   131→   131→    pages.push({ path, title: s(rec.title, title, 80), sections })
+   132→   132→    if (pages.length >= MAX_PAGES) break
+   133→   133→  }
+   134→   134→  if (pages.length === 0) throw new WebFactoryError('El plan no produjo páginas utilizables.', 'invalid_plan')
+   135→   135→  // index.html SIEMPRE existe.
+   136→   136→  if (!pages.some((p) => p.path === 'index.html')) {
+   137→   137→    pages.unshift({ path: 'index.html', title, sections: ['hero', 'características', 'cta', 'footer'] })
+   138→   138→  }
+   139→   139→
+   140→   140→  const ds = data.designSystem ?? {}
+   141→   141→  const designSystem: Record<string, string> = {
+   142→   142→    paletteName: s(ds.paletteName, 'Elegante oscuro', 40),
+   143→   143→    bg: s(ds.bg, '#0c0f14', 20),
+   144→   144→    surface: s(ds.surface, '#121722', 20),
+   145→   145→    text: s(ds.text, '#e8eaf0', 20),
+   146→   146→    muted: s(ds.muted, '#9aa3b2', 20),
+   147→   147→    primary: s(ds.primary, '#10b981', 20),
+   148→   148→    accent: s(ds.accent, '#d4b483', 20),
+   149→   149→    radius: s(ds.radius, '14px', 12),
+   150→   150→    shadow: s(ds.shadow, '0 18px 40px rgba(0,0,0,.35)', 80),
+   151→   151→    headingFont: s(ds.headingFont, 'Georgia, "Times New Roman", serif', 90),
+   152→   152→    bodyFont: s(ds.bodyFont, 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif', 90),
+   153→   153→    motion: s(ds.motion, 'revelación sutil al hacer scroll, microinteracciones en botones', 140),
+   154→   154→  }
+   155→   155→
+   156→   156→  const images: FactoryPlan['images'] = []
+   157→   157→  if (Array.isArray(data.images)) {
+   158→   158→    for (const img of data.images.slice(0, 2)) {
+   159→   159→      if (!img || typeof img !== 'object') continue
+   160→   160→      const rec = img as { slot?: unknown; prompt?: unknown; size?: unknown }
+   161→   161→      const slot = s(rec.slot, '', 40).replace(/[^\w-]/g, '')
+   162→   162→      const prompt = s(rec.prompt, '', 300)
+   163→   163→      if (!slot || !prompt) continue
+   164→   164→      const size = ['1344x768', '1152x864', '1024x1024'].includes(String(rec.size)) ? String(rec.size) : '1344x768'
+   165→   165→      images.push({ slot, prompt, size })
+   166→   166→    }
+   167→   167→  }
+   168→   168→
+   169→   169→  const catalogUrls = new Set(fallbackRefs.map((r) => r.repoUrl))
+   170→   170→  const references: FactoryPlan['references'] = []
+   171→   171→  if (Array.isArray(data.references)) {
+   172→   172→    for (const ref of data.references.slice(0, 4)) {
+   173→   173→      if (!ref || typeof ref !== 'object') continue
+   174→   174→      const rec = ref as { name?: unknown; repoUrl?: unknown; license?: unknown; usage?: unknown }
+   175→   175→      const repoUrl = s(rec.repoUrl, '', 200)
+   176→   176→      if (!catalogUrls.has(repoUrl)) continue // solo referencias reales del catálogo
+   177→   177→      const cat = fallbackRefs.find((r) => r.repoUrl === repoUrl)
+   178→   178→      references.push({
+   179→   179→        name: s(rec.name, cat?.name ?? 'Recurso', 80),
+   180→   180→        repoUrl,
+   181→   181→        license: cat?.licenseSpdx ?? (cat?.status === 'referencia' ? 'sin licencia clara' : 'MIT'),
+   182→   182→        usage: 'referencia-visual',
+   183→   183→      })
+   184→   184→    }
+   185→   185→  }
+   186→   186→  if (references.length === 0 && fallbackRefs.length > 0) {
+   187→   187→    for (const cat of fallbackRefs.slice(0, 3)) {
+   188→   188→      references.push({
+   189→   189→        name: cat.name,
+   190→   190→        repoUrl: cat.repoUrl,
+   191→   191→        license: cat.licenseSpdx ?? (cat.status === 'referencia' ? 'sin licencia clara' : 'MIT'),
+   192→   192→        usage: 'referencia-visual',
+   193→   193→      })
+   194→   194→    }
+   195→   195→  }
+   196→   196→
+   197→   197→  return {
+   198→   198→    title,
+   199→   199→    summary: summary || 'Sitio web profesional generado con OE AI Web Factory.',
+   200→   200→    siteType: s(data.siteType, 'sitio web profesional', 60),
+   201→   201→    aesthetic: s(data.aesthetic, 'moderno y elegante', 120),
+   202→   202→    designSystem,
+   203→   203→    pages,
+   204→   204→    interactions: Array.isArray(data.interactions) ? data.interactions.map((x) => s(x, '', 100)).filter(Boolean).slice(0, 6) : [],
+   205→   205→    images,
+   206→   206→    references,
+   207→   207→  }
+   208→   208→}
+   209→   209→
+   210→   210→/* ── Prompts ──────────────────────────────────────────────────────────────── */
+   211→   211→
+   212→   212→function plannerSystemPrompt(): string {
+   213→   213→  return [
+   214→   214→    'Eres el Planificador de OE AI Web Factory: diseñas sitios web PROFESIONALES y coherentes.',
+   215→   215→    'Responde ÚNICAMENTE con JSON válido, sin markdown, con esta forma exacta:',
+   216→   216→    '{',
+   217→   217→    '  "title": "nombre del sitio (máx 50 car.)",',
+   218→   218→    '  "summary": "1-2 frases del concepto",',
+   219→   219→    '  "siteType": "agencia | clínica | saas | restaurante | portafolio | ecommerce | ...",',
+   220→   220→    '  "aesthetic": "dirección visual concreta (ej: lujo minimalista, cálido artesanal, tech limpio)",',
+   221→   221→    '  "designSystem": {"paletteName": "...", "bg": "#hex", "surface": "#hex", "text": "#hex", "muted": "#hex", "primary": "#hex", "accent": "#hex", "radius": "14px", "shadow": "css box-shadow", "headingFont": "font stack de sistema", "bodyFont": "font stack de sistema", "motion": "1 frase"},',
+   222→   222→    '  "pages": [{"path": "index.html", "title": "Inicio", "sections": ["hero", "servicios", "testimonios", "cta", "footer"]}],',
+   223→   223→    '  "interactions": ["menú móvil", "reveal al scroll", ...],',
+   224→   224→    '  "images": [{"slot": "hero", "prompt": "descripción fotorrealista en inglés", "size": "1344x768"}],',
+   225→   225→    '  "references": [{"name": "...", "repoUrl": "URL EXACTA de la lista", "license": "..."}]',
+   226→   226→    '}',
+   227→   227→    'Reglas obligatorias:',
+   228→   228→    '- Máximo 4 páginas; usa EXACTAMENTE las rutas .html del listado permitido si te lo doy (index.html requerido).',
+   229→   229→    '- SOLO elige secciones con sentido para el negocio (no fuerces todas).',
+   230→   230→    '- designSystem COHERENTE con la estética pedida: un solo producto visual. Colores hex reales; fuentes de SISTEMA (sin Google Fonts/CDN).',
+   231→   231→    '- "references": elige 2-3 de la lista entregada copiando su repoUrl EXACTO. NO inventes repos.',
+   232→   232→    '- images: 0-2 imágenes esenciales (hero o galería); prompts descriptivos en inglés; size "1344x768" (panorámica) o "1024x1024".',
+   233→   233→    '- Contenido del sitio en ESPAÑOL, sin claves ni servicios externos de pago.',
+   234→   234→  ].join('\n')
+   235→   235→}
+   236→   236→
+   237→   237→function plannerUserPrompt(brief: string, refs: CatalogTemplate[], componentKinds: Array<{ category: string; examples: string[] }>, existingPaths: string[] | null): string {
+   238→   238→  const refList = refs
+   239→   239→    .map((r) => `- ${r.name} · ${r.repoUrl} · licencia ${r.licenseSpdx ?? 'sin licencia clara'}${r.status === 'referencia' ? ' (SOLO referencia visual)' : ''}`)
+   240→   240→    .join('\n')
+   241→   241→  const compList = componentKinds.map((c) => `${c.category} (ej: ${c.examples[0]})`).join(', ')
+   242→   242→  const pagesRule = existingPaths
+   243→   243→    ? `Proyecto existente con páginas: ${existingPaths.join(', ')} — el sitio ya tiene estructura; el plan debe respetarla o proponer la mínima mejora.`
+   244→   244→    : 'Rutas .html permitidas: index.html, y hasta 3 más tipo "servicios.html", "galeria.html", "contacto.html", "menu.html", "equipo.html", "blog.html", "precios.html", "habitaciones.html", "destinos.html", "propiedades.html".'
+   245→   245→  return [
+   246→   246→    `Petición del usuario:\n"""\n${brief.slice(0, 3000)}\n"""`,
+   247→   247→    pagesRule,
+   248→   248→    `Referencias DISPONIBLES del catálogo (usa su repoUrl EXACTO):\n${refList}`,
+   249→   249→    `Secciones disponibles como patrones: ${compList}`,
+   250→   250→    'Diseña el sitio completo (plan contrato).',
+   251→   251→  ].join('\n\n')
+   252→   252→}
+   253→   253→
+   254→   254→function shellSystemPrompt(): string {
+   255→   255→  return [
+   256→   256→    'Eres el Generador del Shell de OE AI Web Factory: creas styles.css y app.js compartidos para UN sitio multi-página coherente.',
+   257→   257→    'Responde ÚNICAMENTE con JSON válido: {"css": "...", "js": "..."}',
+   258→   258→    'styles.css OBLIGATORIO:',
+   259→   259→    '- :root con variables EXACTAS: --wf-bg, --wf-surface, --wf-text, --wf-muted, --wf-primary, --wf-accent, --wf-radius, --wf-shadow, --wf-heading, --wf-body (valores del sistema de diseño dado).',
+   260→   260→    '- Clases .wf-* EXACTAS que las páginas usarán: wf-container (max-width 1120px), wf-section (padding vertical generoso), wf-nav (fija arriba, blur), wf-nav-inner, wf-logo, wf-menu (links), wf-menu-open (visible móvil), wf-burger, wf-btn, wf-btn-primary, wf-btn-ghost, wf-hero (min-height 88vh, layout agradable), wf-kicker (etiqueta pequeña mayúscula), wf-title (h1 display con --wf-heading), wf-lead (párrafo intro), wf-grid (grid responsivo auto-fit minmax 260px), wf-card (superficie, borde sutil, hover elevado), wf-media (contenedor con DEGRADADO de fondo usando la paleta + position relative + overflow hidden + min-height), wf-media img (absolute cover), wf-badge, wf-stats, wf-form (inputs con fondo surface), wf-footer, wf-reveal (entrada suave al scroll: opacity+translate, transition .7s), wf-reveal-in (estado visible).',
+   261→   261→    '- Tema según la paleta dada; responsive con @media (max-width: 760px); botones con hover y focus-visible.',
+   262→   262→    '- @media (prefers-reduced-motion: reduce) { .wf-reveal { transition: none; transform: none; opacity: 1 } } y desactivar animaciones decorativas.',
+   263→   263→    'app.js OBLIGATORIO (vanilla, sin dependencias):',
+   264→   264→    '- Menú móvil: .wf-burger alterna .wf-menu-open en su header .wf-nav.',
+   265→   265→    '- Scroll reveal: IntersectionObserver añade .wf-reveal-in a .wf-reveal (si prefers-reduced-motion o sin IO, añade la clase a todo inmediatamente).',
+   266→   266→    '- Formularios: TODOS los form con manejo submit (preventDefault, validación HTML5, feedback visible de éxito en la página, nunca alert()).',
+   267→   267→    '- Año dinámico en [data-wf-year].',
+   268→   268→    '- Enlaces de ancla internos con scroll suave.',
+   269→   269→    '- Calidad: 90-170 líneas de CSS, 40-90 de JS. Sin console.log.',
+   270→   270→  ].join('\n')
+   271→   271→}
+   272→   272→
+   273→   273→function pageSystemPrompt(): string {
+   274→   274→  return [
+   275→   275→    'Eres el Compositor de Páginas de OE AI Web Factory: escribes UNA página HTML del sitio, coherente con el shell compartido.',
+   276→   276→    'Responde ÚNICAMENTE con JSON válido: {"html": "..."}',
+   277→   277→    'Reglas obligatorias:',
+   278→   278→    '- Documento completo: <!DOCTYPE html>, <html lang="es">, head con <title> ÚNICO, meta description específica, meta viewport, <link rel="stylesheet" href="styles.css"> y <script src="app.js" defer></script>.',
+   279→   279→    '- Usa EXCLUSIVAMENTE las clases .wf-* del shell (wf-nav, wf-hero, wf-section, wf-grid, wf-card, wf-btn, wf-media, wf-reveal…) + inline <style> pequeño SOLO para detalles propios de esta página.',
+   280→   280→    '- Header de navegación IDÉNTICO en estructura a las otras páginas: wf-nav con wf-logo (nombre del sitio), menú con enlaces a TODAS las páginas del sitio y wf-burger.',
+   281→   281→    '- Footer wf-footer con columnas, [data-wf-year] y enlaces internos reales.',
+   282→   282→    '- Contenido REAL en español específico del negocio (nada de Lorem ipsum ni "Ejemplo"). Textos persuasivos y concretos.',
+   283→   283→    '- Imágenes: <div class="wf-media"><img src="{{IMG:slot}}" alt="descripción" loading="lazy" onerror="this.remove()"></div> usando los slots dados. Si no se indica slot para una zona, usa composición tipográfica/degradado sin img.',
+   284→   284→    '- Iconografía: SVG inline pequeños (trazo currentColor). NADA de CDNs, Google Fonts, ni recursos externos.',
+   285→   285→    '- Cada sección principal con clase wf-reveal. Formularios con labels visibles, placeholders y required.',
+   286→   286→    '- 60-150 líneas de HTML. Accesible: jerarquía h1→h2→h3, aria-label en nav y burger.',
+   287→   287→  ].join('\n')
+   288→   288→}
+   289→   289→
+   290→   290→function pageUserPrompt(planJson: string, page: FactoryPlan['pages'][number], allPages: FactoryPlan['pages'], imageSlots: string[]): string {
+   291→   291→  return [
+   292→   292→    `Plan contrato del sitio:\n${planJson.slice(0, 6500)}`,
+   293→   293→    `Página a escribir: ${page.path} — título "${page.title}" — secciones: ${page.sections.join(', ')}.`,
+   294→   294→    `Otras páginas del sitio (para el menú): ${allPages.map((p) => `${p.path} (${p.title})`).join(', ')}.`,
+   295→   295→    imageSlots.length > 0
+   296→   296→      ? `Slots de imagen disponibles (usa {{IMG:slot}} donde aporte): ${imageSlots.join(', ')}. Asigna el más importante al hero.`
+   297→   297→      : 'NO hay imágenes: usa composición tipográfica y degradados .wf-media sin <img>.',
+   298→   298→    'Escribe la página completa.',
+   299→   299→  ].join('\n\n')
+   300→   300→}
+   301→   301→
+   302→   302→function updaterSystemPrompt(): string {
+   303→   303→  return [
+   304→   304→    'Eres el Editor de OE AI Web Factory: modificas un sitio existente según la petición del usuario.',
+   305→   305→    'Responde ÚNICAMENTE con JSON válido: {"summary": "1-2 frases", "files": [{"path": "...", "content": "..."}]}',
+   306→   306→    'Reglas obligatorias:',
+   307→   307→    '- Devuelve el contenido COMPLETO de cada archivo que cambies (máx 4). Los no incluidos permanecen.',
+   308→   308→    '- Conserva las clases .wf-*, la estructura de navegación y la coherencia del sistema de diseño.',
+   309→   309→    '- Sin CDNs ni recursos externos. Sin claves. Contenido en español.',
+   310→   310→  ].join('\n')
+   311→   311→}
+   312→   312→
+   313→   313→/* ── Imágenes ─────────────────────────────────────────────────────────────── */
+   314→   314→
+   315→   315→const TINY_SVG =
+   316→   316→  'data:image/svg+xml;utf8,' +
+   317→   317→  encodeURIComponent(
+   318→   318→    '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4"></svg>',
+   319→   319→  )
+   320→   320→
+   321→   321→async function generatePlanImages(
+   322→   322→  sessionId: string,
+   323→   323→  images: FactoryPlan['images'],
+   324→   324→): Promise<Array<{ slot: string; assetId: string; url: string }>> {
+   325→   325→  if (images.length === 0) return []
+   326→   326→  const out: Array<{ slot: string; assetId: string; url: string }> = []
+   327→   327→  await Promise.all(
+   328→   328→    images.map(async (img) => {
+   329→   329→      try {
+   330→   330→        const { default: ZAI } = await import('z-ai-web-dev-sdk')
+   331→   331→        const zai = await ZAI.create()
+   332→   332→        const result = await zai.images.generations.create({ prompt: img.prompt, size: img.size as '1344x768' })
+   333→   333→        const base64 = result?.data?.[0]?.base64
+   334→   334→        if (!base64) return
+   335→   335→        const buffer = Buffer.from(base64, 'base64')
+   336→   336→        const asset = await db.generatedAsset.create({
+   337→   337→          data: { sessionId, prompt: img.prompt.slice(0, 900), size: img.size, mime: 'image/png', data: buffer },
+   338→   338→        })
+   339→   339→        out.push({ slot: img.slot, assetId: asset.id, url: `/api/assets/${asset.id}` })
+   340→   340→      } catch (err) {
+   341→   341→        console.error(`[web-factory] imagen "${img.slot}" falló (continúa con degradado):`, err instanceof Error ? err.message.slice(0, 120) : err)
+   342→   342→      }
+   343→   343→    }),
+   344→   344→  )
+   345→   345→  return out
+   346→   346→}
+   347→   347→
+   348→   348→function injectImages(html: string, images: Array<{ slot: string; url: string }>): string {
+   349→   349→  let out = html
+   350→   350→  for (const img of images) {
+   351→   351→    out = out.replaceAll(`{{IMG:${img.slot}}}`, img.url)
+   352→   352→  }
+   353→   353→  // Slots sin imagen (o fallo): placeholder mínimo válido (el degradado .wf-media manda).
+   354→   354→  out = out.replace(/{{IMG:[\w-]+}}/g, TINY_SVG)
+   355→   355→  return out
+   356→   356→}
+   357→   357→
+   358→   358→/* ── README determinista (procedencia + licencias + guía) ─────────────────── */
+   359→   359→
+   360→   360→function buildReadme(plan: FactoryPlan, fileNames: string[], checks: FactoryCheck[]): string {
+   361→   361→  const refs = plan.references
+   362→   362→    .map((r) => `- ${r.name} — ${r.repoUrl} — licencia: ${r.license} — uso: ${r.usage} (patrón visual; el código de este proyecto es propio)`)
+   363→   363→    .join('\n')
+   364→   364→  const checkLines = checks.map((c) => `- [${c.status}] ${c.check}: ${c.detail}`).join('\n')
+   365→   365→  return [
+   366→   366→    `# ${plan.title}`,
+   367→   367→    '',
+   368→   368→    plan.summary,
+   369→   369→    '',
+   370→   370→    `Generado por **OE AI Web Factory** (módulo de OE AI). Sitio estático: HTML + CSS + JS vanilla, sin dependencias ni compilación.`,
+   371→   371→    '',
+   372→   372→    '## Páginas',
+   373→   373→    plan.pages.map((p) => `- ${p.path} — ${p.title} (${p.sections.join(', ')})`).join('\n'),
+   374→   374→    '',
+   375→   375→    '## Sistema de diseño',
+   376→   376→    `- Paleta: ${plan.designSystem.paletteName} — fondo ${plan.designSystem.bg}, superficie ${plan.designSystem.surface}, primario ${plan.designSystem.primary}, acento ${plan.designSystem.accent}.`,
+   377→   377→    `- Tipografía: títulos ${plan.designSystem.headingFont}; cuerpo ${plan.designSystem.bodyFont}.`,
+   378→   378→    `- Motion: ${plan.designSystem.motion} (respeta prefers-reduced-motion).`,
+   379→   379→    '',
+   380→   380→    '## Cómo ejecutarlo',
+   381→   381→    'Opción 1: abre `index.html` en tu navegador (todo funciona offline salvo las imágenes generadas, documentadas abajo).',
+   382→   382→    'Opción 2: `npx serve .` o `python3 -m http.server` para servirlo localmente.',
+   383→   383→    '',
+   384→   384→    '## Estructura',
+   385→   385→    fileNames.map((f) => `- ${f}`).join('\n'),
+   386→   386→    '',
+   387→   387→    '## Personalización',
+   388→   388→    '- Colores/radios/sombras: edita las variables `:root` al inicio de `styles.css`.',
+   389→   389→    '- Textos: cada página es HTML autocontenido y legible.',
+   390→   390→    '- Imágenes: sustituye las URLs `/api/assets/...` por tus propios archivos (o borra el `<img>`; el degradado `.wf-media` mantiene el diseño).',
+   391→   391→    '',
+   392→   392→    '## Procedencia y licencias (transparencia)',
+   393→   393→    'El código de este sitio fue escrito íntegramente por OE AI (sin copia de repos). Referencias de diseño consultadas:',
+   394→   394→    refs || '- Ninguna (diseño propio).',
+   395→   395→    '',
+   396→   396→    '## Validación automática',
+   397→   397→    checkLines,
+   398→   398→    '',
+   399→   399→    '— OE AI Web Factory · OE BUSINESS',
+   400→   400→  ].join('\n')
+   401→   401→}
+   402→   402→
+   403→   403→/* ── Pipeline ─────────────────────────────────────────────────────────────── */
+   404→   404→
+   405→   405→export async function runWebFactory(input: {
+   406→   406→  brief: string
+   407→   407→  sessionId: string
+   408→   408→  existingProjectId?: string
+   409→   409→  signal?: AbortSignal
+   410→   410→}): Promise<Omit<FactoryResult, 'id' | 'previewUrl' | 'latencyMs'> & { planJson: string; readme: string }> {
+   411→   411→  const start = Date.now()
+   412→   412→  const isUpdate = Boolean(input.existingProjectId)
+   413→   413→
+   414→   414→  // Modo edición: cargar proyecto existente.
+   415→   415→  let existing: { title: string; files: Array<{ path: string; content: string }> } | null = null
+   416→   416→  if (input.existingProjectId) {
+   417→   417→    const project = await db.buildProject.findUnique({
+   418→   418→      where: { id: input.existingProjectId },
+   419→   419→      select: { title: true, files: { select: { path: true, content: true } } },
+   420→   420→    })
+   421→   421→    if (!project) throw new WebFactoryError('El sitio a modificar no existe o fue eliminado.', 'no_files')
+   422→   422→    existing = { title: project.title, files: project.files.map((f) => ({ path: f.path, content: f.content })) }
+   423→   423→  }
+   424→   424→
+   425→   425→  let plan: FactoryPlan
+   426→   426→  if (!existing) {
+   427→   427→    // 1) Plan con catálogo real
+   428→   428→    const [refs, componentKinds] = await Promise.all([pickReferences(input.brief), listComponentKinds()])
+   429→   429→    const planStart = Date.now()
+   430→   430→    const planRes = await buildChatJson<RawPlan>(
+   431→   431→      plannerSystemPrompt(),
+   432→   432→      plannerUserPrompt(input.brief, refs, componentKinds, null),
+   433→   433→      input.signal,
+   434→   434→    )
+   435→   435→    plan = parsePlan(planRes.data, refs)
+   436→   436→    console.error(`[web-factory] plan ${((Date.now() - planStart) / 1000).toFixed(1)}s vía ${planRes.core} · ${plan.pages.length} páginas · ${plan.references.length} referencias`)
+   437→   437→  } else {
+   438→   438→    // Plan mínimo heredado del proyecto existente (para README/procedencia).
+   439→   439→    plan = {
+   440→   440→      title: existing.title,
+   441→   441→      summary: s('', 'Sitio actualizado con OE AI Web Factory.', 400),
+   442→   442→      siteType: 'sitio web',
+   443→   443→      aesthetic: 'consistente con el diseño existente',
+   444→   444→      designSystem: {},
+   445→   445→      pages: existing.files.filter((f) => f.path.endsWith('.html')).map((f) => ({
+   446→   446→        path: f.path,
+   447→   447→        title: f.path.replace('.html', ''),
+   448→   448→        sections: [],
+   449→   449→      })),
+   450→   450→      interactions: [],
+   451→   451→      images: [],
+   452→   452→      references: [],
+   453→   453→    }
+   454→   454→  }
+   455→   455→
+   456→   456→  let files: Array<{ path: string; content: string }>
+   457→   457→  let images: Array<{ slot: string; assetId: string; url: string }> = []
+   458→   458→
+   459→   459→  if (!existing) {
+   460→   460→    // 2) Shell compartido (styles.css + app.js)
+   461→   461→    const shellStart = Date.now()
+   462→   462→    const shell = await buildChatJson<{ css?: unknown; js?: unknown }>(
+   463→   463→      shellSystemPrompt(),
+   464→   464→      `Sistema de diseño:\n${JSON.stringify(plan.designSystem)}\n\nInteracciones pedidas: ${plan.interactions.join('; ') || 'menú móvil y reveal al scroll'}.`,
+   465→   465→      input.signal,
+   466→   466→    )
+   467→   467→    const css = s(shell.data.css, '', 60_000)
+   468→   468→    const js = s(shell.data.js, '', 30_000)
+   469→   469→    if (!css.includes('--wf-bg') || !js.includes('addEventListener')) {
+   470→   470→      throw new WebFactoryError('El shell generado no cumplió el contrato mínimo.', 'invalid_plan')
+   471→   471→    }
+   472→   472→    files = [
+   473→   473→      { path: 'styles.css', content: css },
+   474→   474→      { path: 'app.js', content: js },
+   475→   475→    ]
+   476→   476→    console.error(`[web-factory] shell ${((Date.now() - shellStart) / 1000).toFixed(1)}s vía ${shell.core} · css ${css.length}B · js ${js.length}B`)
+   477→   477→
+   478→   478→    // 3) Imágenes (best-effort, en paralelo)
+   479→   479→    images = await generatePlanImages(input.sessionId, plan.images)
+   480→   480→
+   481→   481→    // 4) Páginas (comparten el shell → coherencia). Arranque escalonado para no
+   482→   482→    //    golpear el núcleo con todas las peticiones a la vez, y UN reintento por
+   483→   483→    //    página fallida: es la fase más cara y perder una página no debe tirar
+   484→   484→    //    todo el sitio (causa raíz histórica del error no_files).
+   485→   485→    const planJson = JSON.stringify(plan)
+   486→   486→    const imageSlots = plan.images.map((i) => i.slot)
+   487→   487→    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+   488→   488→    const buildPageOnce = async (page: FactoryPlan['pages'][number]): Promise<string | null> => {
+   489→   489→      try {
+   490→   490→        const res = await buildChatJson<{ html?: unknown }>(
+   491→   491→          pageSystemPrompt(),
+   492→   492→          pageUserPrompt(planJson, page, plan.pages, imageSlots),
+   493→   493→        )
+   494→   494→        const html = s(res.data.html, '', 90_000)
+   495→   495→        return /<html/i.test(html) ? html : null
+   496→   496→      } catch (err) {
+   497→   497→        console.error(`[web-factory] página ${page.path} falló: ${err instanceof Error ? err.message : 'sin detalle'}`)
+   498→   498→        return null
+   499→   499→      }
+   500→   500→    }
+   501→   501→    const pageHtmls = await Promise.all(
+   502→   502→      plan.pages.map(async (page, i) => {
+   503→   503→        if (i > 0) await sleep(Math.min(i * 1200, 4000))
+   504→   504→        let html = await buildPageOnce(page)
+   505→   505→        if (!html) {
+   506→   506→          await sleep(2500)
+   507→   507→          html = await buildPageOnce(page)
+   508→   508→          if (html) console.error(`[web-factory] página ${page.path} recuperada en el reintento`)
+   509→   509→        }
+   510→   510→        return html
+   511→   511→      }),
+   512→   512→    )
+   513→   513→    for (let i = 0; i < pageHtmls.length; i++) {
+   514→   514→      const html = pageHtmls[i]
+   515→   515→      if (html) files.push({ path: plan.pages[i].path, content: injectImages(html, images) })
+   516→   516→    }
+   517→   517→    const okPages = files.filter((f) => f.path.endsWith('.html')).length
+   518→   518→    if (okPages === 0) {
+   519→   519→      throw new WebFactoryError('Ninguna página se pudo componer. Inténtalo de nuevo.', 'no_files')
+   520→   520→    }
+   521→   521→    const failedPages = pageHtmls.filter((h) => !h).length
+   522→   522→    if (failedPages > 0) console.error(`[web-factory] ${failedPages} página(s) fallaron; se entregan ${okPages}`)
+   523→   523→  } else {
+   524→   524→    // Modo edición: una llamada con el contexto completo.
+   525→   525→    const res = await buildChatJson<{ summary?: unknown; files?: unknown }>(
+   526→   526→      updaterSystemPrompt(),
+   527→   527→      [
+   528→   528→        `Sitio: ${existing.title}`,
+   529→   529→        `Archivos actuales:\n${existing.files.map((f) => `--- ${f.path} ---\n${f.content.slice(0, 9000)}`).join('\n\n').slice(0, 60_000)}`,
+   530→   530→        `Petición del usuario:\n"""\n${input.brief.slice(0, 2500)}\n"""`,
+   531→   531→        'Devuelve el JSON con los archivos completos modificados.',
+   532→   532→      ].join('\n\n'),
+   533→   533→      input.signal,
+   534→   534→    )
+   535→   535→    const changed = Array.isArray(res.data.files)
+   536→   536→      ? (res.data.files as Array<{ path?: unknown; content?: unknown }>)
+   537→   537→          .map((f) => ({ path: sanitizePagePath(f.path) ?? (typeof f.path === 'string' && /^(styles\.css|app\.js|README\.md)$/.test(f.path) ? f.path : null), content: typeof f.content === 'string' ? f.content : '' }))
+   538→   538→          .filter((f): f is { path: string; content: string } => Boolean(f.path) && f.content.trim().length > 0)
+   539→   539→          .slice(0, 5)
+   540→   540→      : []
+   541→   541→    if (changed.length === 0) throw new WebFactoryError('El editor no produjo cambios utilizables.', 'no_files')
+   542→   542→    files = changed.map((f) => ({ path: f.path, content: injectImages(f.content, images) }))
+   543→   543→    plan.summary = s(res.data.summary, plan.summary, 400)
+   544→   544→  }
+   545→   545→
+   546→   546→  // Límite de archivos
+   547→   547→  if (files.length > MAX_FILES) files = files.slice(0, MAX_FILES)
+   548→   548→
+   549→   549→  // 5) Validación honesta (puede autofijar metadatos/alt)
+   550→   550→  const { checks, warnings } = validateSite({ files })
+   551→   551→
+   552→   552→  // 6) README determinista con procedencia y licencias
+   553→   553→  files = files.filter((f) => f.path !== 'README.md')
+   554→   554→  files.push({ path: 'README.md', content: buildReadme(plan, files.map((f) => f.path), checks) })
+   555→   555→
+   556→   556→  return {
+   557→   557→    title: plan.title,
+   558→   558→    summary: plan.summary,
+   559→   559→    mode: 'web',
+   560→   560→    isUpdate,
+   561→   561→    changedPaths: files.map((f) => f.path),
+   562→   562→    files,
+   563→   563→    designSystem: plan.designSystem,
+   564→   564→    references: plan.references,
+   565→   565→    checks,
+   566→   566→    warnings: warnings.slice(0, 12),
+   567→   567→    images: images.map(({ slot, assetId, url }) => ({ slot, assetId, url })),
+   568→   568→    planJson: JSON.stringify(plan),
+   569→   569→    readme: '',
+   570→   570→    // latencia la calcula el llamador
+   571→   571→    ...({ latencyMs: Date.now() - start } as object),
+   572→   572→  }
+   573→   573→}
+   574→   574→
+   575→   575→export { languageFromPath }
+   576→   576→

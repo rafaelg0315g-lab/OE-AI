@@ -1,0 +1,755 @@
+     1→     1→'use client'
+     2→     2→
+     3→     3→/**
+     4→     4→ * use-voice-mode — Modo Voz en tiempo real de OE AI LLM.
+     5→     5→ *
+     6→     6→ * Pipeline (estilo ChatGPT, coste cero en el navegador):
+     7→     7→ *  1. TRANSCRIPCIÓN: Web Speech API (SpeechRecognition) del navegador
+     8→     8→ *     transcribe en vivo y gratis; los subtítulos aparecen mientras hablas.
+     9→     9→ *     Si el navegador no la ofrece (Firefox) o su servicio falla, respaldo
+    10→    10→ *     automático: los chunks PCM viajan al servicio de voz y el ASR del
+    11→    11→ *     núcleo transcribe en el servidor.
+    12→    12→ *  2. SILENCIO: 2 segundos sin hablar → se envía el texto y OE AI responde.
+    13→    13→ *  3. RESPUESTA: el modelo responde en español por escrito (subtítulos) y
+    14→    14→ *     cada frase se convierte en voz con ElevenLabs (respaldo: voz del
+    15→    15→ *     núcleo; último recurso: síntesis local del navegador) y suena apenas
+    16→    16→ *     está lista la primera frase.
+    17→    17→ *
+    18→    18→ * BUG DE CHROME EVITADO: pedir `new AudioContext({ sampleRate: 16_000 })`
+    19→    19→ * produce un flujo de micrófono SILENTE en Windows/algunos dispositivos
+    20→    20→ * cuando la tasa del contexto difiere de la nativa del hardware. El contexto
+    21→    21→ * se abre a la tasa nativa y el remuestreo a 16 kHz ocurre en el cliente.
+    22→    22→ */
+    23→    23→import { useCallback, useEffect, useRef, useState } from 'react'
+    24→    24→import { io, type Socket } from 'socket.io-client'
+    25→    25→import { useAuth } from '@/components/auth/auth-provider'
+    26→    26→
+    27→    27→export type VoicePhase = 'idle' | 'connecting' | 'listening' | 'transcribing' | 'thinking' | 'speaking' | 'error'
+    28→    28→
+    29→    29→type TtsChunkEvent = { turnId: number; sid: number; mime: string; b64: string }
+    30→    30→type TtsSentenceEvent = { turnId: number; sid: number; mime: string }
+    31→    31→type StatusEvent = { turnId: number; phase: 'listening' | 'transcribing' | 'thinking' }
+    32→    32→type TranscriptEvent = { turnId: number; text: string }
+    33→    33→type DeltaEvent = { turnId: number; text: string }
+    34→    34→type DoneEvent = { turnId: number; text?: string }
+    35→    35→type NoticeEvent = { turnId: number; message: string }
+    36→    36→type ErrorEvent = { turnId: number; message: string; errorType?: string | null; status?: number }
+    37→    37→
+    38→    38→/* ── Web Speech API (tipos mínimos; no están en todas las lib.dom) ──────── */
+    39→    39→type SrAlternative = { transcript: string }
+    40→    40→type SrResult = ArrayLike<SrAlternative> & { isFinal: boolean }
+    41→    41→type SrResultList = ArrayLike<SrResult>
+    42→    42→type SrResultEvent = { resultIndex: number; results: SrResultList }
+    43→    43→type SrErrorEvent = { error: string; message?: string }
+    44→    44→interface SpeechRecognitionLike {
+    45→    45→  lang: string
+    46→    46→  continuous: boolean
+    47→    47→  interimResults: boolean
+    48→    48→  maxAlternatives: number
+    49→    49→  start(): void
+    50→    50→  stop(): void
+    51→    51→  abort(): void
+    52→    52→  onresult: ((event: SrResultEvent) => void) | null
+    53→    53→  onerror: ((event: SrErrorEvent) => void) | null
+    54→    54→  onend: (() => void) | null
+    55→    55→  onspeechend: (() => void) | null
+    56→    56→}
+    57→    57→type SpeechRecognitionCtor = new () => SpeechRecognitionLike
+    58→    58→
+    59→    59→/** SpeechRecognition (Chrome/Edge/Safari) o webkitSpeechRecognition. */
+    60→    60→function getSpeechRecognition(): SpeechRecognitionCtor | null {
+    61→    61→  if (typeof window === 'undefined') return null
+    62→    62→  const w = window as unknown as { SpeechRecognition?: SpeechRecognitionCtor; webkitSpeechRecognition?: SpeechRecognitionCtor }
+    63→    63→  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null
+    64→    64→}
+    65→    65→
+    66→    66→function spanishLocale(): string {
+    67→    67→  if (typeof navigator !== 'undefined' && navigator.language?.startsWith('es')) return navigator.language
+    68→    68→  return 'es-ES'
+    69→    69→}
+    70→    70→
+    71→    71→const GATEWAY_URL = '/?XTransformPort=3010'
+    72→    72→const WIRE_RATE = 16_000 // todo el audio viaja remuestreado a 16 kHz
+    73→    73→const CHUNK_SAMPLES = 1600 // ~100 ms a 16 kHz
+    74→    74→const SILENCE_TO_REPLY_MS = 2_000 // regla del producto: 2 s de silencio → responder
+    75→    75→
+    76→    76→export function useVoiceMode(options: { onTurnComplete?: (sessionId: string) => void }) {
+    77→    77→  const { onTurnComplete } = options
+    78→    78→  const auth = useAuth()
+    79→    79→
+    80→    80→  const [phase, setPhase] = useState<VoicePhase>('idle')
+    81→    81→  const [muted, setMuted] = useState(false)
+    82→    82→  const [transcript, setTranscript] = useState('') // última frase del usuario (en vivo)
+    83→    83→  const [reply, setReply] = useState('') // respuesta en vivo del modelo
+    84→    84→  const [notice, setNotice] = useState<string | null>(null)
+    85→    85→  const [error, setError] = useState<string | null>(null)
+    86→    86→  const [level, setLevel] = useState(0) // 0..1 para el orbe
+    87→    87→
+    88→    88→  // Refs de infraestructura (fuera del estado: el audio no re-renderiza).
+    89→    89→  const socketRef = useRef<Socket | null>(null)
+    90→    90→  const ctxRef = useRef<AudioContext | null>(null)
+    91→    91→  const streamRef = useRef<MediaStream | null>(null)
+    92→    92→  const processorRef = useRef<ScriptProcessorNode | null>(null)
+    93→    93→  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
+    94→    94→  const rafRef = useRef<number | null>(null)
+    95→    95→
+    96→    96→  const mutedRef = useRef(false)
+    97→    97→  const phaseRef = useRef<VoicePhase>('idle')
+    98→    98→  const sessionIdRef = useRef<string | null>(null)
+    99→    99→  const turnRef = useRef(0) // turno actual (descarta eventos viejos)
+   100→   100→  // Vigilancia de micrófono mudo: avisa una vez si el audio llega en silencio
+   101→   101→  // (permiso parcial, dispositivo apagado o el bug de Chrome descrito arriba).
+   102→   102→  const silentSinceRef = useRef<number | null>(null)
+   103→   103→  const micWarnedRef = useRef(false)
+   104→   104→
+   105→   105→  // Web Speech API (transcripción primaria en el navegador).
+   106→   106→  const recognitionRef = useRef<SpeechRecognitionLike | null>(null)
+   107→   107→  const webSpeechActiveRef = useRef(false) // el servicio de reconocimiento funciona
+   108→   108→  const recAliveRef = useRef(false) // hay una sesión de reconocimiento abierta
+   109→   109→  const finalTextRef = useRef('') // dictado final acumulado (aún sin enviar)
+   110→   110→  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+   111→   111→  const startRecognitionRef = useRef<() => boolean>(() => false)
+   112→   112→  const ttsAudioThisTurn = useRef(false) // llegó audio TTS en el turno actual
+   113→   113→
+   114→   114→  // Cola de reproducción TTS
+   115→   115→  const pendingTts = useRef(new Map<number, { mime: string; chunks: Uint8Array[] }>())
+   116→   116→  const nextSid = useRef(0) // siguiente frase esperada en orden
+   117→   117→  const chainEnd = useRef(0) // t del fin del audio programado
+   118→   118→  const liveSources = useRef<AudioBufferSourceNode[]>([])
+   119→   119→  const awaitingTts = useRef(0) // frases encoladas sin reproducir
+   120→   120→  const llmDone = useRef(false)
+   121→   121→
+   122→   122→  const setPhaseSafe = useCallback((p: VoicePhase) => {
+   123→   123→    phaseRef.current = p
+   124→   124→    setPhase(p)
+   125→   125→  }, [])
+   126→   126→
+   127→   127→  /* ── Web Speech: dictado en vivo → 2 s de silencio → enviar ────────────── */
+   128→   128→
+   129→   129→  const sendUtterance = useCallback((text: string) => {
+   130→   130→    const clean = text.trim()
+   131→   131→    if (!clean) return
+   132→   132→    finalTextRef.current = ''
+   133→   133→    socketRef.current?.emit('voice:text', { text: clean.slice(0, 4000) })
+   134→   134→  }, [])
+   135→   135→
+   136→   136→  /** 2 segundos sin hablar → se envía lo dictado y OE AI responde. */
+   137→   137→  const armSilenceTimer = useCallback(() => {
+   138→   138→    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current)
+   139→   139→    silenceTimerRef.current = setTimeout(() => {
+   140→   140→      silenceTimerRef.current = null
+   141→   141→      if (!mutedRef.current && finalTextRef.current.trim()) sendUtterance(finalTextRef.current)
+   142→   142→    }, SILENCE_TO_REPLY_MS)
+   143→   143→  }, [sendUtterance])
+   144→   144→
+   145→   145→  const stopSilenceTimer = useCallback(() => {
+   146→   146→    if (silenceTimerRef.current) {
+   147→   147→      clearTimeout(silenceTimerRef.current)
+   148→   148→      silenceTimerRef.current = null
+   149→   149→    }
+   150→   150→  }, [])
+   151→   151→
+   152→   152→  /** Abre (o reabre) el reconocimiento del navegador. false = no disponible. */
+   153→   153→  const startRecognition = useCallback((): boolean => {
+   154→   154→    const Ctor = getSpeechRecognition()
+   155→   155→    if (!Ctor) return false
+   156→   156→    try {
+   157→   157→      recognitionRef.current?.abort()
+   158→   158→    } catch {
+   159→   159→      /* no había sesión */
+   160→   160→    }
+   161→   161→    let rec: SpeechRecognitionLike
+   162→   162→    try {
+   163→   163→      rec = new Ctor()
+   164→   164→    } catch {
+   165→   165→      return false
+   166→   166→    }
+   167→   167→    rec.lang = spanishLocale()
+   168→   168→    rec.continuous = true
+   169→   169→    rec.interimResults = true
+   170→   170→    rec.maxAlternatives = 1
+   171→   171→    rec.onresult = (e) => {
+   172→   172→      let interim = ''
+   173→   173→      for (let i = e.resultIndex; i < e.results.length; i++) {
+   174→   174→        const result = e.results[i]
+   175→   175→        const text = result[0]?.transcript ?? ''
+   176→   176→        if (result.isFinal) finalTextRef.current = `${finalTextRef.current} ${text}`.trim()
+   177→   177→        else interim += text
+   178→   178→      }
+   179→   179→      const shown = `${finalTextRef.current} ${interim}`.trim()
+   180→   180→      if (shown) {
+   181→   181→        setTranscript(shown) // subtítulos en vivo, como ChatGPT
+   182→   182→        armSilenceTimer() // mientras hable se pospone el envío
+   183→   183→      }
+   184→   184→    }
+   185→   185→    rec.onspeechend = () => armSilenceTimer()
+   186→   186→    rec.onerror = (e) => {
+   187→   187→      if (e.error === 'no-speech' || e.error === 'aborted') return
+   188→   188→      // Servicio de reconocimiento caído o sin permiso → respaldo: ASR del
+   189→   189→      // núcleo por audio (los chunks PCM vuelven a fluir automáticamente).
+   190→   190→      webSpeechActiveRef.current = false
+   191→   191→      recAliveRef.current = false
+   192→   192→      try {
+   193→   193→        rec.abort()
+   194→   194→      } catch {
+   195→   195→        /* ya cerrado */
+   196→   196→      }
+   197→   197→      if (recognitionRef.current === rec) recognitionRef.current = null
+   198→   198→      stopSilenceTimer()
+   199→   199→      finalTextRef.current = ''
+   200→   200→      setNotice('El reconocimiento de voz del navegador no está disponible; uso el transcriptor del núcleo.')
+   201→   201→    }
+   202→   202→    rec.onend = () => {
+   203→   203→      recAliveRef.current = false
+   204→   204→      // Chrome corta la sesión periódicamente: se reabre sola mientras
+   205→   205→      // sigamos en escucha (nunca durante la respuesta, para no transcribir
+   206→   206→      // la voz de OE AI por los altavoces).
+   207→   207→      if (webSpeechActiveRef.current && !mutedRef.current && phaseRef.current === 'listening') {
+   208→   208→        setTimeout(() => {
+   209→   209→          if (webSpeechActiveRef.current && !mutedRef.current && phaseRef.current === 'listening' && !recAliveRef.current) {
+   210→   210→            startRecognitionRef.current()
+   211→   211→          }
+   212→   212→        }, 250)
+   213→   213→      }
+   214→   214→    }
+   215→   215→    recognitionRef.current = rec
+   216→   216→    try {
+   217→   217→      rec.start()
+   218→   218→      webSpeechActiveRef.current = true
+   219→   219→      recAliveRef.current = true
+   220→   220→      return true
+   221→   221→    } catch {
+   222→   222→      recAliveRef.current = false
+   223→   223→      return false
+   224→   224→    }
+   225→   225→  }, [armSilenceTimer, stopSilenceTimer])
+   226→   226→
+   227→   227→  useEffect(() => {
+   228→   228→    startRecognitionRef.current = startRecognition
+   229→   229→  }, [startRecognition])
+   230→   230→
+   231→   231→  /** Silencia el reconocimiento mientras OE AI habla (evita eco). */
+   232→   232→  const pauseRecognition = useCallback(() => {
+   233→   233→    try {
+   234→   234→      recognitionRef.current?.abort()
+   235→   235→    } catch {
+   236→   236→      /* noop */
+   237→   237→    }
+   238→   238→  }, [])
+   239→   239→
+   240→   240→  /** Reanuda el reconocimiento al volver a escucha (si usa Web Speech). */
+   241→   241→  const ensureRecognition = useCallback(() => {
+   242→   242→    if (!webSpeechActiveRef.current || mutedRef.current) return
+   243→   243→    if (phaseRef.current !== 'listening' || recAliveRef.current) return
+   244→   244→    startRecognition()
+   245→   245→  }, [startRecognition])
+   246→   246→
+   247→   247→  /** Último recurso: síntesis local del navegador si ningún proveedor sonó. */
+   248→   248→  const speakLocalFallback = useCallback(
+   249→   249→    (text: string) => {
+   250→   250→      try {
+   251→   251→        const synth = typeof window !== 'undefined' ? window.speechSynthesis : null
+   252→   252→        if (!synth || !text.trim()) return
+   253→   253→        const u = new SpeechSynthesisUtterance(text.slice(0, 800))
+   254→   254→        u.lang = spanishLocale()
+   255→   255→        const voices = synth.getVoices()
+   256→   256→        const esVoice = voices.find((v) => v.lang === u.lang) ?? voices.find((v) => v.lang.startsWith('es'))
+   257→   257→        if (esVoice) u.voice = esVoice
+   258→   258→        u.rate = 1.02
+   259→   259→        u.onend = () => {
+   260→   260→          if (phaseRef.current === 'speaking' && liveSources.current.length === 0 && awaitingTts.current <= 0) {
+   261→   261→            setPhaseSafe('listening')
+   262→   262→            ensureRecognition()
+   263→   263→          }
+   264→   264→        }
+   265→   265→        setPhaseSafe('speaking')
+   266→   266→        synth.cancel()
+   267→   267→        synth.speak(u)
+   268→   268→      } catch {
+   269→   269→        /* sin síntesis local disponible */
+   270→   270→      }
+   271→   271→    },
+   272→   272→    [ensureRecognition, setPhaseSafe],
+   273→   273→  )
+   274→   274→
+   275→   275→  const clearPlayback = useCallback(() => {
+   276→   276→    for (const src of liveSources.current) {
+   277→   277→      try {
+   278→   278→        src.onended = null
+   279→   279→        src.stop()
+   280→   280→      } catch {
+   281→   281→        /* ya detenido */
+   282→   282→      }
+   283→   283→    }
+   284→   284→    liveSources.current = []
+   285→   285→    pendingTts.current.clear()
+   286→   286→    awaitingTts.current = 0
+   287→   287→    nextSid.current = 0
+   288→   288→    chainEnd.current = 0
+   289→   289→    llmDone.current = false
+   290→   290→    try {
+   291→   291→      window.speechSynthesis?.cancel() // corta también la síntesis local
+   292→   292→    } catch {
+   293→   293→      /* noop */
+   294→   294→    }
+   295→   295→  }, [])
+   296→   296→
+   297→   297→  /** Programa una frase decodificada de forma continua (sin huecos). */
+   298→   298→  const scheduleBuffer = useCallback(
+   299→   299→    (buffer: AudioBuffer) => {
+   300→   300→      const ctx = ctxRef.current
+   301→   301→      if (!ctx) return
+   302→   302→      const source = ctx.createBufferSource()
+   303→   303→      source.buffer = buffer
+   304→   304→      source.connect(ctx.destination)
+   305→   305→      const startAt = Math.max(ctx.currentTime + 0.04, chainEnd.current + 0.02)
+   306→   306→      source.start(startAt)
+   307→   307→      chainEnd.current = startAt + buffer.duration
+   308→   308→      liveSources.current.push(source)
+   309→   309→      source.onended = () => {
+   310→   310→        liveSources.current = liveSources.current.filter((s) => s !== source)
+   311→   311→        if (liveSources.current.length === 0 && awaitingTts.current <= 0 && llmDone.current && phaseRef.current === 'speaking') {
+   312→   312→          setPhaseSafe('listening')
+   313→   313→          setReply((r) => r) // conserva subtítulos visibles
+   314→   314→          ensureRecognition() // vuelve a escuchar cuando OE AI termina de hablar
+   315→   315→        }
+   316→   316→      }
+   317→   317→    },
+   318→   318→    [ensureRecognition, setPhaseSafe],
+   319→   319→  )
+   320→   320→
+   321→   321→  /** Acumula chunks TTS y reproduce cada frase al completarse (en orden). */
+   322→   322→  const handleTtsChunk = useCallback(
+   323→   323→    (data: TtsChunkEvent) => {
+   324→   324→      if (data.turnId < turnRef.current) return
+   325→   325→      const ctx = ctxRef.current
+   326→   326→      if (!ctx) return
+   327→   327→      ttsAudioThisTurn.current = true
+   328→   328→      let entry = pendingTts.current.get(data.sid)
+   329→   329→      if (!entry) {
+   330→   330→        entry = { mime: data.mime, chunks: [] }
+   331→   331→        pendingTts.current.set(data.sid, entry)
+   332→   332→        awaitingTts.current += 1
+   333→   333→      }
+   334→   334→      entry.chunks.push(new Uint8Array(atob(data.b64).split('').map((c) => c.charCodeAt(0))))
+   335→   335→    },
+   336→   336→    [],
+   337→   337→  )
+   338→   338→
+   339→   339→  const handleTtsSentence = useCallback(
+   340→   340→    (data: TtsSentenceEvent) => {
+   341→   341→      if (data.turnId < turnRef.current) return
+   342→   342→      const ctx = ctxRef.current
+   343→   343→      const entry = pendingTts.current.get(data.sid)
+   344→   344→      pendingTts.current.delete(data.sid)
+   345→   345→      if (!ctx || !entry || entry.chunks.length === 0) {
+   346→   346→        awaitingTts.current = Math.max(0, awaitingTts.current - 1)
+   347→   347→        return
+   348→   348→      }
+   349→   349→      const total = entry.chunks.reduce((n, c) => n + c.length, 0)
+   350→   350→      const bytes = new Uint8Array(total)
+   351→   351→      let off = 0
+   352→   352→      for (const c of entry.chunks) {
+   353→   353→        bytes.set(c, off)
+   354→   354→        off += c.length
+   355→   355→      }
+   356→   356→      const copy = new ArrayBuffer(bytes.length)
+   357→   357→      new Uint8Array(copy).set(bytes)
+   358→   358→      void ctx
+   359→   359→        .decodeAudioData(copy)
+   360→   360→        .then((buffer) => {
+   361→   361→          if (phaseRef.current !== 'error') {
+   362→   362→            setPhaseSafe('speaking')
+   363→   363→            pauseRecognition() // mientras OE AI habla, el navegador no escucha
+   364→   364→            scheduleBuffer(buffer)
+   365→   365→          }
+   366→   366→        })
+   367→   367→        .catch(() => {
+   368→   368→          // frase indecifrable: continúa la cola
+   369→   369→        })
+   370→   370→        .finally(() => {
+   371→   371→          awaitingTts.current = Math.max(0, awaitingTts.current - 1)
+   372→   372→        })
+   373→   373→    },
+   374→   374→    [pauseRecognition, scheduleBuffer],
+   375→   375→  )
+   376→   376→
+   377→   377→  const teardownAudio = useCallback(() => {
+   378→   378→    if (rafRef.current) cancelAnimationFrame(rafRef.current)
+   379→   379→    rafRef.current = null
+   380→   380→    try {
+   381→   381→      processorRef.current?.disconnect()
+   382→   382→      sourceRef.current?.disconnect()
+   383→   383→    } catch {
+   384→   384→      /* noop */
+   385→   385→    }
+   386→   386→    processorRef.current = null
+   387→   387→    sourceRef.current = null
+   388→   388→    streamRef.current?.getTracks().forEach((t) => t.stop())
+   389→   389→    streamRef.current = null
+   390→   390→    void ctxRef.current?.close().catch(() => undefined)
+   391→   391→    ctxRef.current = null
+   392→   392→    setLevel(0)
+   393→   393→  }, [])
+   394→   394→
+   395→   395→  /** Captura de micrófono: PCM16 → chunks ~100 ms → WebSocket (respaldo ASR). */
+   396→   396→  const startMic = useCallback(async () => {
+   397→   397→    const stream = await navigator.mediaDevices.getUserMedia({
+   398→   398→      audio: {
+   399→   399→        echoCancellation: true,
+   400→   400→        noiseSuppression: true,
+   401→   401→        autoGainControl: true,
+   402→   402→      },
+   403→   403→    })
+   404→   404→    streamRef.current = stream
+   405→   405→    // Tasa NATIVA (ver nota del bug de Chrome arriba); el remuestreo a 16 kHz
+   406→   406→    // ocurre en onaudioprocess antes de emitir cada chunk.
+   407→   407→    const ctx = new AudioContext()
+   408→   408→    ctxRef.current = ctx
+   409→   409→    if (ctx.state === 'suspended') await ctx.resume()
+   410→   410→    const actualRate = ctx.sampleRate
+   411→   411→    micWarnedRef.current = false
+   412→   412→    silentSinceRef.current = null
+   413→   413→
+   414→   414→    const source = ctx.createMediaStreamSource(stream)
+   415→   415→    sourceRef.current = source
+   416→   416→    const processor = ctx.createScriptProcessor(4096, 1, 1)
+   417→   417→    processorRef.current = processor
+   418→   418→
+   419→   419→    let acc: Float32Array[] = []
+   420→   420→    let accLen = 0
+   421→   421→
+   422→   422→    processor.onaudioprocess = (e) => {
+   423→   423→      const input = e.inputBuffer.getChannelData(0)
+   424→   424→      // Resampleo simple al target de 16 kHz si el contexto difiere.
+   425→   425→      let samples = input
+   426→   426→      if (Math.abs(actualRate - 16_000) > 1) {
+   427→   427→        const ratio = actualRate / 16_000
+   428→   428→        const outLen = Math.floor(input.length / ratio)
+   429→   429→        const out = new Float32Array(outLen)
+   430→   430→        for (let i = 0; i < outLen; i++) {
+   431→   431→          const from = Math.floor(i * ratio)
+   432→   432→          const to = Math.min(input.length, Math.floor((i + 1) * ratio))
+   433→   433→          let sum = 0
+   434→   434→          for (let j = from; j < to; j++) sum += input[j]
+   435→   435→          out[i] = sum / Math.max(1, to - from)
+   436→   436→        }
+   437→   437→        samples = out
+   438→   438→      }
+   439→   439→      acc.push(samples)
+   440→   440→      accLen += samples.length
+   441→   441→      if (accLen < CHUNK_SAMPLES) return
+   442→   442→
+   443→   443→      const merged = new Float32Array(accLen)
+   444→   444→      let off = 0
+   445→   445→      for (const part of acc) {
+   446→   446→        merged.set(part, off)
+   447→   447→        off += part.length
+   448→   448→      }
+   449→   449→      acc = []
+   450→   450→      accLen = 0
+   451→   451→
+   452→   452→      // RMS del chunk (nivel de voz real).
+   453→   453→      let sumSq = 0
+   454→   454→      for (let i = 0; i < merged.length; i++) sumSq += merged[i] * merged[i]
+   455→   455→      const rms = Math.sqrt(sumSq / merged.length)
+   456→   456→
+   457→   457→      if (mutedRef.current || !socketRef.current?.connected) return
+   458→   458→      // Con Web Speech API activa, la transcripción ocurre en el navegador:
+   459→   459→      // NO enviar audio (el ASR del servidor dispararía turnos duplicados).
+   460→   460→      if (webSpeechActiveRef.current) return
+   461→   461→      const pcm = new Int16Array(merged.length)
+   462→   462→      for (let i = 0; i < merged.length; i++) {
+   463→   463→        const s = Math.max(-1, Math.min(1, merged[i]))
+   464→   464→        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff
+   465→   465→      }
+   466→   466→      const b64 = arrayBufferToBase64(pcm.buffer)
+   467→   467→      socketRef.current.emit('voice:audio', { b64, rms })
+   468→   468→    }
+   469→   469→    source.connect(processor)
+   470→   470→    // El procesador requiere ir a destino para correr; su salida es silencio.
+   471→   471→    processor.connect(ctx.destination)
+   472→   472→
+   473→   473→    // Nivel en vivo para el orbe (analyser independiente del envío).
+   474→   474→    const analyser = ctx.createAnalyser()
+   475→   475→    analyser.fftSize = 512
+   476→   476→    source.connect(analyser)
+   477→   477→    const levelData = new Uint8Array(analyser.frequencyBinCount)
+   478→   478→    const tick = () => {
+   479→   479→      if (mutedRef.current) {
+   480→   480→        // Silenciado: el orbe no reacciona a la voz (el micrófono no se envía).
+   481→   481→        setLevel(0)
+   482→   482→        silentSinceRef.current = null
+   483→   483→      } else {
+   484→   484→        analyser.getByteTimeDomainData(levelData)
+   485→   485→        let sumSq = 0
+   486→   486→        for (let i = 0; i < levelData.length; i++) {
+   487→   487→          const v = (levelData[i] - 128) / 128
+   488→   488→          sumSq += v * v
+   489→   489→        }
+   490→   490→        const rms = Math.sqrt(sumSq / levelData.length)
+   491→   491→        setLevel(Math.min(1, rms * 6))
+   492→   492→        // Micrófono mudo: si en escucha activa no llega NINGÚN nivel de audio
+   493→   493→        // durante varios segundos, el usuario merece saberlo (antes se quedaba
+   494→   494→        // en "Escuchando…" para siempre sin entender por qué no responde).
+   495→   495→        if (rms < 0.0012) {
+   496→   496→          silentSinceRef.current ??= performance.now()
+   497→   497→          if (!micWarnedRef.current && phaseRef.current === 'listening' && performance.now() - silentSinceRef.current > 4_000) {
+   498→   498→            micWarnedRef.current = true
+   499→   499→            setNotice(
+   500→   500→              'No estoy recibiendo audio de tu micrófono. Revisa que el dispositivo correcto esté activo y los permisos del navegador.',
+   501→   501→            )
+   502→   502→          }
+   503→   503→        } else {
+   504→   504→          if (micWarnedRef.current) {
+   505→   505→            micWarnedRef.current = false
+   506→   506→            setNotice(null)
+   507→   507→          }
+   508→   508→          silentSinceRef.current = null
+   509→   509→        }
+   510→   510→      }
+   511→   511→      rafRef.current = requestAnimationFrame(tick)
+   512→   512→    }
+   513→   513→    rafRef.current = requestAnimationFrame(tick)
+   514→   514→  }, [])
+   515→   515→
+   516→   516→  const start = useCallback(
+   517→   517→    async (sessionId: string | null) => {
+   518→   518→      if (phaseRef.current !== 'idle' && phaseRef.current !== 'error') return
+   519→   519→      setError(null)
+   520→   520→      setNotice(null)
+   521→   521→      setTranscript('')
+   522→   522→      setReply('')
+   523→   523→      setPhaseSafe('connecting')
+   524→   524→      sessionIdRef.current = sessionId
+   525→   525→      turnRef.current = 0
+   526→   526→      // Estado limpio de dictado y reconocimiento.
+   527→   527→      finalTextRef.current = ''
+   528→   528→      stopSilenceTimer()
+   529→   529→      ttsAudioThisTurn.current = false
+   530→   530→      webSpeechActiveRef.current = false
+   531→   531→      recAliveRef.current = false
+   532→   532→      try {
+   533→   533→        recognitionRef.current?.abort()
+   534→   534→      } catch {
+   535→   535→        /* noop */
+   536→   536→      }
+   537→   537→      recognitionRef.current = null
+   538→   538→      try {
+   539→   539→        await startMic()
+   540→   540→      } catch {
+   541→   541→        setPhaseSafe('error')
+   542→   542→        setError(
+   543→   543→          'No se pudo acceder al micrófono. Revisa los permisos del navegador (candado en la barra de direcciones) e inténtalo de nuevo.',
+   544→   544→        )
+   545→   545→        teardownAudio()
+   546→   546→        return
+   547→   547→      }
+   548→   548→
+   549→   549→      const token = await auth.getAccessToken().catch(() => null)
+   550→   550→      const socket = io(GATEWAY_URL, {
+   551→   551→        transports: ['websocket', 'polling'],
+   552→   552→        // Envía cookies (oe_guest) también por el transporte polling del gateway.
+   553→   553→        withCredentials: true,
+   554→   554→        forceNew: true,
+   555→   555→        reconnection: true,
+   556→   556→        reconnectionAttempts: 5,
+   557→   557→        reconnectionDelay: 1000,
+   558→   558→        timeout: 10_000,
+   559→   559→        auth: { token: token ?? undefined, sessionId: sessionId ?? undefined },
+   560→   560→      })
+   561→   561→      socketRef.current = socket
+   562→   562→
+   563→   563→      socket.on('connect', () => {
+   564→   564→        // IMPORTANTE: se anuncia la tasa del FORMATO EN EL CABLE (los chunks
+   565→   565→        // siempre viajan remuestreados a 16 kHz), no la tasa del contexto de
+   566→   566→        // audio local: si no, el servidor envolvería el PCM en WAV con la
+   567→   567→        // cabecera equivocada y el ASR escucharía audio acelerado.
+   568→   568→        socket.emit('voice:start', { sampleRate: WIRE_RATE })
+   569→   569→        setPhaseSafe('listening')
+   570→   570→        // Web Speech API: transcripción gratis y en vivo en el navegador.
+   571→   571→        // Si no existe (Firefox) o su servicio falla, el respaldo es el ASR
+   572→   572→        // del núcleo con estos mismos chunks PCM.
+   573→   573→        if (!startRecognition()) webSpeechActiveRef.current = false
+   574→   574→      })
+   575→   575→      socket.on('connect_error', () => {
+   576→   576→        if (phaseRef.current === 'connecting') {
+   577→   577→          setPhaseSafe('error')
+   578→   578→          setError('No se pudo conectar con el servicio de voz. Inténtalo de nuevo en unos segundos.')
+   579→   579→        }
+   580→   580→      })
+   581→   581→      socket.on('voice:status', (data: StatusEvent) => {
+   582→   582→        if (data.phase === 'listening') {
+   583→   583→          if (phaseRef.current !== 'idle') {
+   584→   584→            setPhaseSafe('listening')
+   585→   585→            ensureRecognition()
+   586→   586→          }
+   587→   587→        } else if (data.phase === 'transcribing') {
+   588→   588→          setPhaseSafe('transcribing')
+   589→   589→        } else if (data.phase === 'thinking') {
+   590→   590→          clearPlayback()
+   591→   591→          ttsAudioThisTurn.current = false
+   592→   592→          setPhaseSafe('thinking')
+   593→   593→        }
+   594→   594→      })
+   595→   595→      socket.on('voice:user-transcript', (data: TranscriptEvent) => {
+   596→   596→        turnRef.current = data.turnId
+   597→   597→        setTranscript(data.text)
+   598→   598→      })
+   599→   599→      socket.on('voice:assistant-delta', (data: DeltaEvent) => {
+   600→   600→        if (data.turnId < turnRef.current) return
+   601→   601→        setReply((prev) => prev + data.text)
+   602→   602→      })
+   603→   603→      socket.on('voice:tts-chunk', handleTtsChunk)
+   604→   604→      socket.on('voice:tts-sentence', handleTtsSentence)
+   605→   605→      socket.on('voice:assistant-done', (data: DoneEvent) => {
+   606→   606→        llmDone.current = true
+   607→   607→        if (liveSources.current.length === 0 && awaitingTts.current <= 0 && phaseRef.current !== 'error') {
+   608→   608→          if (!ttsAudioThisTurn.current && data.text) {
+   609→   609→            // Ningún proveedor de voz pudo sonar → síntesis local del navegador.
+   610→   610→            speakLocalFallback(data.text)
+   611→   611→          } else {
+   612→   612→            setPhaseSafe('listening')
+   613→   613→            ensureRecognition()
+   614→   614→          }
+   615→   615→        }
+   616→   616→        const sid = sessionIdRef.current
+   617→   617→        if (sid) onTurnComplete?.(sid)
+   618→   618→      })
+   619→   619→      socket.on('voice:notice', (data: NoticeEvent) => {
+   620→   620→        if (data.turnId < turnRef.current) return
+   621→   621→        setNotice(data.message)
+   622→   622→        if (phaseRef.current !== 'idle') setPhaseSafe('listening')
+   623→   623→      })
+   624→   624→      socket.on('voice:error', (data: ErrorEvent) => {
+   625→   625→        clearPlayback()
+   626→   626→        setError(data.message)
+   627→   627→        finalTextRef.current = ''
+   628→   628→        stopSilenceTimer()
+   629→   629→        if (data.errorType === 'guest_limit_reached') {
+   630→   630→          setPhaseSafe('error')
+   631→   631→          socketRef.current?.disconnect()
+   632→   632→          socketRef.current = null
+   633→   633→          teardownAudio()
+   634→   634→        } else if (phaseRef.current !== 'idle') {
+   635→   635→          setPhaseSafe('listening')
+   636→   636→          ensureRecognition()
+   637→   637→        }
+   638→   638→      })
+   639→   639→    },
+   640→   640→    [
+   641→   641→      auth,
+   642→   642→      clearPlayback,
+   643→   643→      ensureRecognition,
+   644→   644→      handleTtsChunk,
+   645→   645→      handleTtsSentence,
+   646→   646→      onTurnComplete,
+   647→   647→      speakLocalFallback,
+   648→   648→      startMic,
+   649→   649→      startRecognition,
+   650→   650→      stopSilenceTimer,
+   651→   651→      teardownAudio,
+   652→   652→    ],
+   653→   653→  )
+   654→   654→
+   655→   655→  const interrupt = useCallback(() => {
+   656→   656→    clearPlayback()
+   657→   657→    socketRef.current?.emit('voice:interrupt')
+   658→   658→    setReply((r) => r)
+   659→   659→    finalTextRef.current = ''
+   660→   660→    stopSilenceTimer()
+   661→   661→    if (phaseRef.current !== 'idle' && phaseRef.current !== 'error') setPhaseSafe('listening')
+   662→   662→    ensureRecognition()
+   663→   663→  }, [clearPlayback, ensureRecognition, stopSilenceTimer])
+   664→   664→
+   665→   665→  const toggleMute = useCallback(() => {
+   666→   666→    const next = !mutedRef.current
+   667→   667→    mutedRef.current = next
+   668→   668→    setMuted(next)
+   669→   669→    socketRef.current?.emit('voice:mute', { muted: next })
+   670→   670→    if (next) {
+   671→   671→      // MUTE TOTAL: el navegador deja de escuchar de inmediato y se descarta
+   672→   672→      // lo dictado a medias; el servidor también ignora el audio en curso.
+   673→   673→      try {
+   674→   674→        recognitionRef.current?.abort()
+   675→   675→      } catch {
+   676→   676→        /* noop */
+   677→   677→      }
+   678→   678→      finalTextRef.current = ''
+   679→   679→      stopSilenceTimer()
+   680→   680→    } else {
+   681→   681→      ensureRecognition()
+   682→   682→    }
+   683→   683→  }, [ensureRecognition, stopSilenceTimer])
+   684→   684→
+   685→   685→  const stop = useCallback(() => {
+   686→   686→    socketRef.current?.emit('voice:end')
+   687→   687→    socketRef.current?.disconnect()
+   688→   688→    socketRef.current = null
+   689→   689→    clearPlayback()
+   690→   690→    teardownAudio()
+   691→   691→    try {
+   692→   692→      recognitionRef.current?.abort()
+   693→   693→    } catch {
+   694→   694→      /* noop */
+   695→   695→    }
+   696→   696→    recognitionRef.current = null
+   697→   697→    webSpeechActiveRef.current = false
+   698→   698→    recAliveRef.current = false
+   699→   699→    finalTextRef.current = ''
+   700→   700→    stopSilenceTimer()
+   701→   701→    ttsAudioThisTurn.current = false
+   702→   702→    mutedRef.current = false
+   703→   703→    setMuted(false)
+   704→   704→    phaseRef.current = 'idle'
+   705→   705→    setPhase('idle')
+   706→   706→    setNotice(null)
+   707→   707→    micWarnedRef.current = false
+   708→   708→    silentSinceRef.current = null
+   709→   709→  }, [clearPlayback, stopSilenceTimer, teardownAudio])
+   710→   710→
+   711→   711→  // Limpieza al desmontar.
+   712→   712→  useEffect(() => {
+   713→   713→    return () => {
+   714→   714→      socketRef.current?.disconnect()
+   715→   715→      try {
+   716→   716→        recognitionRef.current?.abort()
+   717→   717→      } catch {
+   718→   718→        /* noop */
+   719→   719→      }
+   720→   720→      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current)
+   721→   721→      try {
+   722→   722→        window.speechSynthesis?.cancel()
+   723→   723→      } catch {
+   724→   724→        /* noop */
+   725→   725→      }
+   726→   726→      teardownAudio()
+   727→   727→    }
+   728→   728→  }, [stopSilenceTimer, teardownAudio])
+   729→   729→
+   730→   730→  return {
+   731→   731→    phase,
+   732→   732→    muted,
+   733→   733→    level,
+   734→   734→    transcript,
+   735→   735→    reply,
+   736→   736→    notice,
+   737→   737→    error,
+   738→   738→    start,
+   739→   739→    stop,
+   740→   740→    interrupt,
+   741→   741→    toggleMute,
+   742→   742→    active: phase !== 'idle',
+   743→   743→  }
+   744→   744→}
+   745→   745→
+   746→   746→function arrayBufferToBase64(buffer: ArrayBuffer): string {
+   747→   747→  const bytes = new Uint8Array(buffer)
+   748→   748→  let binary = ''
+   749→   749→  const chunk = 0x8000
+   750→   750→  for (let i = 0; i < bytes.length; i += chunk) {
+   751→   751→    binary += String.fromCharCode(...bytes.subarray(i, i + chunk))
+   752→   752→  }
+   753→   753→  return btoa(binary)
+   754→   754→}
+   755→   755→

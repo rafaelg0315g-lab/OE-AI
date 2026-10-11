@@ -1,0 +1,748 @@
+     1→'use client'
+     2→
+     3→/**
+     4→ * Composer premium estilo GPT/Meta AI: entrada grande redondeada con botón "+"
+     5→ * (acciones rápidas), selector de modo (Instantáneo / Reflexivo), dictado por
+     6→ * voz (Web Speech API) y envío con animación. Enter envía, Shift+Enter salta línea.
+     7→ */
+     8→import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+     9→import { AnimatePresence, motion } from 'framer-motion'
+    10→import { ArrowUp, AudioLines, BookOpen, Bot, Brain, Clapperboard, Eye, FileText, Globe, ImagePlus, Loader2, Mic, Network, Plus, Sparkles, Square, Wand2, X, Zap } from 'lucide-react'
+    11→import { toast } from 'sonner'
+    12→import { Button } from '@/components/ui/button'
+    13→import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+    14→import { CATALOG } from '@/lib/ai/catalog/catalog'
+    15→import { fileToDownscaledDataUrl } from '@/lib/image-client'
+    16→import { useUiStore } from '@/lib/store/ui-store'
+    17→import { useAuth } from '@/components/auth/auth-provider'
+    18→import { cn } from '@/lib/utils'
+    19→import { useChat } from './chat-context'
+    20→import { GuestGateOverlay, GuestQuotaPill } from './guest-gate'
+    21→import { ImageEditDialog, ReadDocDialog, VideoDialog, type PendingDoc } from './tools-dialogs'
+    22→import { VoiceNoteButton } from './voice-note-button'
+    23→
+    24→/* Tipado mínimo de la Web Speech API (sin dependencias externas). */
+    25→interface RecognitionLike {
+    26→  lang: string
+    27→  continuous: boolean
+    28→  interimResults: boolean
+    29→  start(): void
+    30→  stop(): void
+    31→  onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null
+    32→  onend: (() => void) | null
+    33→  onerror: (() => void) | null
+    34→}
+    35→type RecognitionCtor = new () => RecognitionLike
+    36→
+    37→const MAX_CHARS = 8000
+    38→
+    39→function subscribeNoop(_onChange: () => void): () => void {
+    40→  // Suscripción nula: la disponibilidad de la Web Speech API no cambia en vivo.
+    41→  return () => {}
+    42→}
+    43→
+    44→function getSpeechSupportSnapshot(): boolean {
+    45→  const w = window as unknown as { SpeechRecognition?: RecognitionCtor; webkitSpeechRecognition?: RecognitionCtor }
+    46→  return Boolean(w.SpeechRecognition ?? w.webkitSpeechRecognition)
+    47→}
+    48→
+    49→/** Imagen adjuntada lista para enviarse con el mensaje (visión). */
+    50→interface ComposerAttachment {
+    51→  assetId: string
+    52→  previewUrl: string
+    53→}
+    54→
+    55→const DRAFT_PREFIX = 'oe-draft:'
+    56→
+    57→export function Composer({ variant = 'docked' }: { variant?: 'hero' | 'docked' }) {
+    58→  const chat = useChat()
+    59→  const { user } = useAuth()
+    60→  const mode = useUiStore((s) => s.mode)
+    61→  const setMode = useUiStore((s) => s.setMode)
+    62→  const setNetworkOpen = useUiStore((s) => s.setNetworkOpen)
+    63→  const [input, setInput] = useState('')
+    64→  const [listening, setListening] = useState(false)
+    65→  const [webSearch, setWebSearch] = useState(false)
+    66→  const [attachment, setAttachment] = useState<ComposerAttachment | null>(null)
+    67→  const [uploading, setUploading] = useState(false)
+    68→  const [attachNote, setAttachNote] = useState<string | null>(null)
+    69→  // Diálogos de herramientas y documento pendiente (Task 19-e)
+    70→  const [plusOpen, setPlusOpen] = useState(false)
+    71→  const [videoOpen, setVideoOpen] = useState(false)
+    72→  const [imageEditOpen, setImageEditOpen] = useState(false)
+    73→  const [readDocOpen, setReadDocOpen] = useState(false)
+    74→  const [pendingDoc, setPendingDoc] = useState<PendingDoc | null>(null)
+    75→  const [docReading, setDocReading] = useState(false)
+    76→  // Soporte de dictado: snapshot externo estable (evita setState en efecto y
+    77→  // desajustes de hidratación: false en servidor, real en cliente).
+    78→  const speechSupported = useSyncExternalStore(
+    79→    subscribeNoop,
+    80→    getSpeechSupportSnapshot,
+    81→    () => false,
+    82→  )
+    83→  const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+    84→  const recognitionRef = useRef<RecognitionLike | null>(null)
+    85→  const fileInputRef = useRef<HTMLInputElement | null>(null)
+    86→  const skipDraftSaveRef = useRef(true)
+    87→
+    88→  // Auto-altura del textarea
+    89→  useEffect(() => {
+    90→    const el = textareaRef.current
+    91→    if (!el) return
+    92→    el.style.height = 'auto'
+    93→    el.style.height = `${Math.min(el.scrollHeight, 200)}px`
+    94→  }, [input])
+    95→
+    96→  // Borrador autoguardado: al cambiar de conversación se restaura el suyo
+    97→  // (y se limpia cualquier adjunto o documento pendiente del contexto anterior).
+    98→  useEffect(() => {
+    99→    skipDraftSaveRef.current = true
+   100→    setAttachment(null)
+   101→    setAttachNote(null)
+   102→    setPendingDoc(null)
+   103→    try {
+   104→      setInput(window.localStorage.getItem(`${DRAFT_PREFIX}${chat.activeId ?? 'new'}`) ?? '')
+   105→    } catch {
+   106→      setInput('')
+   107→    }
+   108→  }, [chat.activeId])
+   109→
+   110→  // Guardar el borrador al escribir (se omite el guardado justo tras cargar).
+   111→  useEffect(() => {
+   112→    if (skipDraftSaveRef.current) {
+   113→      skipDraftSaveRef.current = false
+   114→      return
+   115→    }
+   116→    try {
+   117→      window.localStorage.setItem(`${DRAFT_PREFIX}${chat.activeId ?? 'new'}`, input)
+   118→    } catch {
+   119→      // sin almacenamiento disponible
+   120→    }
+   121→  }, [input, chat.activeId])
+   122→
+   123→  // Foco desde atajo / chip de sugerencia
+   124→  useEffect(() => {
+   125→    const focus = () => textareaRef.current?.focus()
+   126→    window.addEventListener('oe-focus-composer', focus)
+   127→    return () => window.removeEventListener('oe-focus-composer', focus)
+   128→  }, [])
+   129→
+   130→  /** Envía el mensaje con el documento pendiente: primero lee el enlace/PDF
+   131→   *  (POST /api/tools/read-doc) y luego envía el turno con docContext. Si la
+   132→   *  lectura falla, NO se envía nada (error honesto con toast). */
+   133→  async function submitWithDoc(text: string) {
+   134→    const doc = pendingDoc
+   135→    if (!doc || docReading) return
+   136→    setDocReading(true)
+   137→    try {
+   138→      let body: Record<string, unknown>
+   139→      if (doc.kind === 'url') {
+   140→        body = { url: doc.url, name: doc.name }
+   141→      } else {
+   142→        const file = doc.file
+   143→        if (!file) throw new Error('El archivo del documento ya no está disponible.')
+   144→        const dataUrl = await new Promise<string>((resolve, reject) => {
+   145→          const reader = new FileReader()
+   146→          reader.onload = () => resolve(String(reader.result))
+   147→          reader.onerror = () => reject(new Error('No se pudo leer el PDF.'))
+   148→          reader.readAsDataURL(file)
+   149→        })
+   150→        body = { fileDataUrl: dataUrl, name: doc.name }
+   151→      }
+   152→      const res = await fetch('/api/tools/read-doc', {
+   153→        method: 'POST',
+   154→        headers: { 'Content-Type': 'application/json' },
+   155→        body: JSON.stringify(body),
+   156→      })
+   157→      const data = (await res.json().catch(() => null)) as { title?: string; text?: string; error?: string } | null
+   158→      if (!res.ok || !data?.text) {
+   159→        throw new Error(data?.error ?? 'No se pudo leer el documento.')
+   160→      }
+   161→      const title = (data.title ?? '').trim() || doc.name
+   162→      toast.success(`Documento leído: ${title}`)
+   163→      setPendingDoc(null)
+   164→      setInput('')
+   165→      try {
+   166→        window.localStorage.setItem(`${DRAFT_PREFIX}${chat.activeId ?? 'new'}`, '')
+   167→      } catch {
+   168→        // sin almacenamiento
+   169→      }
+   170→      void chat.send(text, { docContext: data.text, docTitle: title })
+   171→    } catch (err) {
+   172→      toast.error(err instanceof Error ? err.message : 'No se pudo leer el documento.')
+   173→    } finally {
+   174→      setDocReading(false)
+   175→    }
+   176→  }
+   177→
+   178→  function submit() {
+   179→    const text = input.trim()
+   180→    if ((!text && !attachment && !pendingDoc) || chat.pending || uploading || docReading) return
+   181→
+   182→    // Documento pendiente (enlace/PDF): se lee y el turno lleva su contexto.
+   183→    if (pendingDoc) {
+   184→      void submitWithDoc(text || '¿De qué trata este documento?')
+   185→      return
+   186→    }
+   187→
+   188→    // Imagen adjuntada: turno de visión (el núcleo analiza la imagen con el texto).
+   189→    if (attachment) {
+   190→      const finalText = text || 'Describe esta imagen en detalle.'
+   191→      const att = attachment
+   192→      setInput('')
+   193→      setAttachment(null)
+   194→      setAttachNote(null)
+   195→      try {
+   196→        window.localStorage.setItem(`${DRAFT_PREFIX}${chat.activeId ?? 'new'}`, '')
+   197→      } catch {
+   198→        // sin almacenamiento
+   199→      }
+   200→      void chat.send(finalText, { attachment: { assetId: att.assetId, previewUrl: att.previewUrl } })
+   201→      return
+   202→    }
+   203→
+   204→    // Comandos del núcleo: /imagen y /buscar
+   205→    if (text.startsWith('/imagen ')) {
+   206→      const prompt = text.slice('/imagen '.length).trim()
+   207→      if (prompt.length >= 3) {
+   208→        setInput('')
+   209→        void chat.generateImage(prompt)
+   210→      }
+   211→      return
+   212→    }
+   213→    if (text === '/imagen') {
+   214→      setInput('/imagen ')
+   215→      window.dispatchEvent(new Event('oe-focus-composer'))
+   216→      return
+   217→    }
+   218→    if (text.startsWith('/buscar ')) {
+   219→      const query = text.slice('/buscar '.length).trim()
+   220→      if (query) {
+   221→        setInput('')
+   222→        void chat.send(query, { webSearch: true })
+   223→      }
+   224→      return
+   225→    }
+   226→    if (text === '/buscar') {
+   227→      setInput('/buscar ')
+   228→      window.dispatchEvent(new Event('oe-focus-composer'))
+   229→      return
+   230→    }
+   231→
+   232→    setInput('')
+   233→    void chat.send(text, { webSearch })
+   234→    if (webSearch) setWebSearch(false)
+   235→  }
+   236→
+   237→  /** Prepara y sube una imagen adjuntada (botón, arrastre o portapapeles). */
+   238→  async function handleFiles(files: FileList | File[] | null) {
+   239→    const file = Array.from(files ?? [])[0]
+   240→    if (!file || uploading) return
+   241→    setAttachNote(null)
+   242→    if (!file.type.startsWith('image/')) {
+   243→      setAttachNote('Solo se pueden adjuntar imágenes (PNG, JPEG, WebP, GIF).')
+   244→      return
+   245→    }
+   246→    if (file.size > 12 * 1024 * 1024) {
+   247→      setAttachNote('La imagen supera los 12 MB. Elige una más ligera.')
+   248→      return
+   249→    }
+   250→    setUploading(true)
+   251→    try {
+   252→      const dataUrl = await fileToDownscaledDataUrl(file)
+   253→      const res = await fetch('/api/assets/upload', {
+   254→        method: 'POST',
+   255→        headers: { 'Content-Type': 'application/json' },
+   256→        body: JSON.stringify({ dataUrl }),
+   257→      })
+   258→      const data = (await res.json().catch(() => null)) as { id?: string; url?: string; error?: string } | null
+   259→      if (!res.ok || !data?.id || !data.url) {
+   260→        throw new Error(data?.error ?? 'No se pudo subir la imagen.')
+   261→      }
+   262→      setAttachment({ assetId: data.id, previewUrl: data.url })
+   263→    } catch (err) {
+   264→      setAttachNote(err instanceof Error ? err.message : 'No se pudo subir la imagen.')
+   265→    } finally {
+   266→      setUploading(false)
+   267→    }
+   268→  }
+   269→
+   270→  function toggleDictation() {
+   271→    if (listening) {
+   272→      recognitionRef.current?.stop()
+   273→      return
+   274→    }
+   275→    const w = window as unknown as { SpeechRecognition?: RecognitionCtor; webkitSpeechRecognition?: RecognitionCtor }
+   276→    const Ctor = w.SpeechRecognition ?? w.webkitSpeechRecognition
+   277→    if (!Ctor) return
+   278→    const rec = new Ctor()
+   279→    rec.lang = 'es-CO'
+   280→    rec.continuous = false
+   281→    rec.interimResults = false
+   282→    rec.onresult = (e) => {
+   283→      const transcript = Array.from({ length: e.results.length }, (_, i) => e.results[i][0]?.transcript ?? '')
+   284→        .join(' ')
+   285→        .trim()
+   286→      if (transcript) setInput((prev) => (prev ? `${prev} ${transcript}` : transcript))
+   287→    }
+   288→    rec.onend = () => {
+   289→      setListening(false)
+   290→      recognitionRef.current = null
+   291→    }
+   292→    rec.onerror = () => {
+   293→      setListening(false)
+   294→      recognitionRef.current = null
+   295→    }
+   296→    recognitionRef.current = rec
+   297→    setListening(true)
+   298→    rec.start()
+   299→  }
+   300→
+   301→  // Cuota agotada (invitados): el envío queda bloqueado en UI; el servidor lo impone siempre.
+   302→  const canSend =
+   303→    (input.trim().length > 0 || Boolean(attachment) || Boolean(pendingDoc)) &&
+   304→    !chat.pending &&
+   305→    !chat.guestBlocked &&
+   306→    !uploading &&
+   307→    !docReading
+   308→  const nearLimit = input.length > MAX_CHARS - 500
+   309→
+   310→  return (
+   311→    <div className={cn('w-full', variant === 'hero' ? '' : 'pb-3')}>
+   312→      {/* Cuota de invitado: contador discreto (solo usuarios sin sesión) */}
+   313→      <GuestQuotaPill className="mb-2.5" />
+   314→      <motion.div
+   315→        initial={variant === 'hero' ? { opacity: 0, y: 18, scale: 0.985 } : false}
+   316→        animate={{ opacity: 1, y: 0, scale: 1 }}
+   317→        transition={{ duration: 0.45, ease: [0.22, 1, 0.36, 1] }}
+   318→        className="oe-composer-glow relative rounded-[28px] border border-border/70 bg-secondary/45 shadow-[0_10px_50px_-16px_oklch(0_0_0/0.55)] backdrop-blur-xl"
+   319→      >
+   320→        {/* Campo de texto */}
+   321→        <label htmlFor="oe-composer-input" className="sr-only">
+   322→          Pregunta a OE AI
+   323→        </label>
+   324→        <textarea
+   325→          id="oe-composer-input"
+   326→          ref={textareaRef}
+   327→          value={input}
+   328→          onChange={(e) => setInput(e.target.value.slice(0, MAX_CHARS))}
+   329→          onPaste={(e) => {
+   330→            // Pegar una imagen del portapapeles la adjunta para visión.
+   331→            const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith('image/'))
+   332→            if (files.length > 0) {
+   333→              e.preventDefault()
+   334→              void handleFiles(files)
+   335→            }
+   336→          }}
+   337→          onKeyDown={(e) => {
+   338→            if (e.key === 'Enter' && !e.shiftKey) {
+   339→              e.preventDefault()
+   340→              submit()
+   341→            }
+   342→          }}
+   343→          rows={variant === 'hero' ? 2 : 1}
+   344→          placeholder="Pregunta a OE AI… escribe /imagen, /buscar o pega una imagen"
+   345→          aria-label="Pregunta a OE AI"
+   346→          className="scrollbar-slim block max-h-[200px] w-full resize-none bg-transparent px-5 pt-4 pb-1 text-[15px] leading-relaxed text-foreground placeholder:text-muted-foreground/80 focus:outline-none"
+   347→        />
+   348→
+   349→        {/* Imagen adjuntada (visión) o subida en curso */}
+   350→        {(attachment || uploading) && (
+   351→          <div className="mx-4 mb-1 flex items-center gap-2.5 rounded-xl border border-border/60 bg-secondary/50 p-1.5 pr-2">
+   352→            {uploading ? (
+   353→              <>
+   354→                <span className="grid size-10 shrink-0 place-items-center rounded-lg bg-secondary/70">
+   355→                  <Loader2 className="size-4 animate-spin text-emerald-300" aria-hidden />
+   356→                </span>
+   357→                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">Preparando imagen…</span>
+   358→              </>
+   359→            ) : attachment ? (
+   360→              <>
+   361→                <img
+   362→                  src={attachment.previewUrl}
+   363→                  alt="Imagen adjuntada para análisis"
+   364→                  className="size-10 shrink-0 rounded-lg object-cover ring-1 ring-border/60"
+   365→                />
+   366→                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+   367→                  Imagen lista — OE AI la verá junto a tu mensaje
+   368→                </span>
+   369→                <button
+   370→                  type="button"
+   371→                  onClick={() => {
+   372→                    setAttachment(null)
+   373→                    setAttachNote(null)
+   374→                  }}
+   375→                  aria-label="Quitar imagen adjuntada"
+   376→                  className="grid size-7 shrink-0 place-items-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+   377→                >
+   378→                  <X className="size-3.5" aria-hidden />
+   379→                </button>
+   380→              </>
+   381→            ) : null}
+   382→          </div>
+   383→        )}
+   384→        {attachNote && (
+   385→          <p className="mx-4 mb-1 text-[11px] text-amber-300/90" role="status">
+   386→            {attachNote}
+   387→          </p>
+   388→        )}
+   389→
+   390→        {/* Documento pendiente (enlace/PDF): se lee al enviar el mensaje */}
+   391→        {pendingDoc && (
+   392→          <div className="mx-4 mb-1 flex items-center gap-2.5 rounded-xl border border-border/60 bg-secondary/50 p-1.5 pr-2">
+   393→            {docReading ? (
+   394→              <>
+   395→                <span className="grid size-10 shrink-0 place-items-center rounded-lg bg-secondary/70">
+   396→                  <Loader2 className="size-4 animate-spin text-emerald-300" aria-hidden />
+   397→                </span>
+   398→                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">Leyendo documento…</span>
+   399→              </>
+   400→            ) : (
+   401→              <>
+   402→                <span className="grid size-10 shrink-0 place-items-center rounded-lg bg-secondary/70">
+   403→                  <FileText className="size-4 text-emerald-300" aria-hidden />
+   404→                </span>
+   405→                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+   406→                  {pendingDoc.kind === 'url' ? 'Enlace' : 'PDF'}: {pendingDoc.name}
+   407→                </span>
+   408→                <button
+   409→                  type="button"
+   410→                  onClick={() => setPendingDoc(null)}
+   411→                  aria-label="Quitar documento pendiente"
+   412→                  className="grid size-7 shrink-0 place-items-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+   413→                >
+   414→                  <X className="size-3.5" aria-hidden />
+   415→                </button>
+   416→              </>
+   417→            )}
+   418→          </div>
+   419→        )}
+   420→
+   421→        {/* Fila de controles */}
+   422→        <div className="flex items-center gap-1.5 px-3 pb-3">
+   423→          {/* + Acciones rápidas */}
+   424→          <input
+   425→            ref={fileInputRef}
+   426→            type="file"
+   427→            accept="image/png,image/jpeg,image/webp,image/gif"
+   428→            className="hidden"
+   429→            tabIndex={-1}
+   430→            aria-hidden
+   431→            onChange={(e) => {
+   432→              void handleFiles(e.target.files)
+   433→              e.currentTarget.value = ''
+   434→            }}
+   435→          />
+   436→          <Popover open={plusOpen} onOpenChange={setPlusOpen}>
+   437→            <PopoverTrigger asChild>
+   438→              <button
+   439→                type="button"
+   440→                aria-label="Acciones rápidas"
+   441→                className="grid size-10 place-items-center rounded-full border border-border/60 bg-secondary/40 text-muted-foreground transition-all hover:scale-105 hover:bg-accent hover:text-foreground"
+   442→              >
+   443→                <Plus className="size-[18px]" aria-hidden />
+   444→              </button>
+   445→            </PopoverTrigger>
+   446→            <PopoverContent side="top" align="start" className="w-64 rounded-2xl p-1.5">
+   447→              <button
+   448→                type="button"
+   449→                onClick={() => {
+   450→                  fileInputRef.current?.click()
+   451→                }}
+   452→                className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm transition-colors hover:bg-accent"
+   453→              >
+   454→                <Eye className="size-4 text-emerald-300" aria-hidden />
+   455→                Adjuntar imagen (visión)
+   456→              </button>
+   457→              <button
+   458→                type="button"
+   459→                onClick={() => {
+   460→                  setInput('/imagen ')
+   461→                  window.dispatchEvent(new Event('oe-focus-composer'))
+   462→                }}
+   463→                className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm transition-colors hover:bg-accent"
+   464→              >
+   465→                <ImagePlus className="size-4 text-emerald-300" aria-hidden />
+   466→                Generar una imagen
+   467→                <kbd className="ml-auto rounded border border-border/60 bg-secondary/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">/imagen</kbd>
+   468→              </button>
+   469→              <button
+   470→                type="button"
+   471→                onClick={() => {
+   472→                  setWebSearch(true)
+   473→                  window.dispatchEvent(new Event('oe-focus-composer'))
+   474→                }}
+   475→                className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm transition-colors hover:bg-accent"
+   476→              >
+   477→                <Globe className="size-4 text-emerald-300" aria-hidden />
+   478→                Buscar en la web
+   479→                <kbd className="ml-auto rounded border border-border/60 bg-secondary/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">/buscar</kbd>
+   480→              </button>
+   481→              <div aria-hidden className="mx-2 my-1 border-t border-border/50" />
+   482→              {/* Herramientas IA (Task 19-e) */}
+   483→              <button
+   484→                type="button"
+   485→                onClick={() => {
+   486→                  setPlusOpen(false)
+   487→                  setVideoOpen(true)
+   488→                }}
+   489→                className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm transition-colors hover:bg-accent"
+   490→              >
+   491→                <Clapperboard className="size-4 text-emerald-300" aria-hidden />
+   492→                Generar video (IA)
+   493→              </button>
+   494→              <button
+   495→                type="button"
+   496→                onClick={() => {
+   497→                  setPlusOpen(false)
+   498→                  setImageEditOpen(true)
+   499→                }}
+   500→                className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm transition-colors hover:bg-accent"
+   501→              >
+   502→                <Wand2 className="size-4 text-emerald-300" aria-hidden />
+   503→                Editar imagen (IA)
+   504→              </button>
+   505→              <button
+   506→                type="button"
+   507→                onClick={() => {
+   508→                  setPlusOpen(false)
+   509→                  setReadDocOpen(true)
+   510→                }}
+   511→                className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm transition-colors hover:bg-accent"
+   512→              >
+   513→                <FileText className="size-4 text-emerald-300" aria-hidden />
+   514→                Leer enlace o PDF
+   515→              </button>
+   516→              <div className="flex w-full items-center gap-2.5 rounded-xl px-3 py-1.5 text-sm">
+   517→                <Mic className="size-4 shrink-0 text-emerald-300" aria-hidden />
+   518→                <span className="min-w-0 flex-1">Mensaje de voz</span>
+   519→                <span className="shrink-0">
+   520→                  <VoiceNoteButton
+   521→                    onTranscribed={(t) => {
+   522→                      setInput((prev) => (prev ? `${prev} ${t}` : t))
+   523→                      setPlusOpen(false)
+   524→                      window.dispatchEvent(new Event('oe-focus-composer'))
+   525→                    }}
+   526→                    disabled={uploading || docReading}
+   527→                  />
+   528→                </span>
+   529→              </div>
+   530→              <div aria-hidden className="mx-2 my-1 border-t border-border/50" />
+   531→              <button
+   532→                type="button"
+   533→                onClick={() => {
+   534→                  chat.newChat()
+   535→                  window.dispatchEvent(new Event('oe-focus-composer'))
+   536→                }}
+   537→                className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm transition-colors hover:bg-accent"
+   538→              >
+   539→                <Sparkles className="size-4 text-emerald-300" aria-hidden />
+   540→                Nueva conversación
+   541→              </button>
+   542→              <button
+   543→                type="button"
+   544→                onClick={() => setNetworkOpen(true)}
+   545→                className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm transition-colors hover:bg-accent"
+   546→              >
+   547→                <Network className="size-4 text-emerald-300" aria-hidden />
+   548→                Conexiones · red de modelos
+   549→              </button>
+   550→              <a
+   551→                href="/apis"
+   552→                className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm transition-colors hover:bg-accent"
+   553→              >
+   554→                <BookOpen className="size-4 text-emerald-300" aria-hidden />
+   555→                Centro de APIs
+   556→              </a>
+   557→              <a
+   558→                href="/agent"
+   559→                className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm transition-colors hover:bg-accent"
+   560→              >
+   561→                <Bot className="size-4 text-emerald-300" aria-hidden />
+   562→                Modo Agente · construir una app
+   563→                <span className="ml-auto shrink-0 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300">
+   564→                  En construcción
+   565→                </span>
+   566→              </a>
+   567→            </PopoverContent>
+   568→          </Popover>
+   569→
+   570→          <div className="flex-1" />
+   571→
+   572→          {/* Contador cerca del límite */}
+   573→          {nearLimit && (
+   574→            <span className="mr-1 hidden font-mono text-[11px] text-muted-foreground sm:inline">
+   575→              {input.length}/{MAX_CHARS}
+   576→            </span>
+   577→          )}
+   578→
+   579→          {/* Modo: Instantáneo / Reflexivo */}
+   580→          <button
+   581→            type="button"
+   582→            onClick={() => setMode(mode === 'instant' ? 'reflective' : 'instant')}
+   583→            aria-pressed={mode === 'reflective'}
+   584→            aria-label={`Modo de respuesta: ${mode === 'instant' ? 'Instantáneo' : 'Reflexivo'}. Alternar.`}
+   585→            className={cn(
+   586→              'flex h-10 items-center gap-1.5 rounded-full border px-3.5 text-[13px] font-medium transition-all hover:scale-[1.03]',
+   587→              mode === 'reflective'
+   588→                ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200'
+   589→                : 'border-border/60 bg-secondary/40 text-foreground/85 hover:bg-accent',
+   590→            )}
+   591→          >
+   592→            {mode === 'instant' ? <Zap className="size-4" aria-hidden /> : <Brain className="size-4" aria-hidden />}
+   593→            {mode === 'instant' ? 'Instantáneo' : 'Reflexivo'}
+   594→          </button>
+   595→
+   596→          {/* Dictado por voz */}
+   597→          <TooltipishButton
+   598→            label={speechSupported ? (listening ? 'Detener dictado' : 'Dictar por voz') : 'Dictado no disponible en este navegador'}
+   599→            disabled={!speechSupported}
+   600→            onClick={toggleDictation}
+   601→            active={listening}
+   602→          >
+   603→            <MicIcon className={cn('size-[18px]', listening && 'text-emerald-300')} listening={listening} />
+   604→          </TooltipishButton>
+   605→
+   606→          {/* Búsqueda web activada para el próximo mensaje */}
+   607→          <TooltipishButton
+   608→            label={webSearch ? 'Búsqueda web activada: se desactivará tras enviar' : 'Buscar en la web antes de responder'}
+   609→            onClick={() => setWebSearch((v) => !v)}
+   610→            active={webSearch}
+   611→          >
+   612→            <Globe className={cn('size-[18px]', webSearch && 'text-emerald-300')} aria-hidden />
+   613→          </TooltipishButton>
+   614→
+   615→          {/* Modo Voz: conversación hablada en tiempo real (Voz ➡️ Texto ➡️ IA ➡️ Voz) */}
+   616→          <TooltipishButton
+   617→            label={
+   618→              chat.guestBlocked && !user
+   619→                ? 'Se agotó tu cuota: inicia sesión para usar el modo voz'
+   620→                : 'Modo Voz: habla con OE AI LLM en tiempo real'
+   621→            }
+   622→            disabled={chat.guestBlocked && !user}
+   623→            onClick={() => window.dispatchEvent(new Event('oe-open-voice'))}
+   624→          >
+   625→            <AudioLines className="size-[18px]" aria-hidden />
+   626→          </TooltipishButton>
+   627→
+   628→          {/* Enviar / Detener */}
+   629→          <AnimatePresence mode="wait" initial={false}>
+   630→            {chat.pending ? (
+   631→              <motion.button
+   632→                key="stop"
+   633→                type="button"
+   634→                onClick={chat.stop}
+   635→                initial={{ scale: 0.8, opacity: 0 }}
+   636→                animate={{ scale: 1, opacity: 1 }}
+   637→                exit={{ scale: 0.8, opacity: 0 }}
+   638→                aria-label="Detener respuesta"
+   639→                className="grid size-10 place-items-center rounded-full bg-foreground text-background transition-transform hover:scale-105"
+   640→              >
+   641→                <Square className="size-4 fill-current" aria-hidden />
+   642→              </motion.button>
+   643→            ) : (
+   644→              <motion.button
+   645→                key="send"
+   646→                type="button"
+   647→                onClick={submit}
+   648→                disabled={!canSend}
+   649→                initial={{ scale: 0.8, opacity: 0 }}
+   650→                animate={{ scale: 1, opacity: 1 }}
+   651→                exit={{ scale: 0.8, opacity: 0 }}
+   652→                whileHover={canSend ? { scale: 1.06 } : undefined}
+   653→                aria-label="Enviar mensaje"
+   654→                className={cn(
+   655→                  'grid size-10 place-items-center rounded-full transition-all',
+   656→                  canSend
+   657→                    ? 'bg-gradient-to-br from-emerald-400 to-teal-600 text-emerald-950 shadow-[0_4px_18px_-4px_oklch(0.78_0.14_168/0.5)]'
+   658→                    : 'cursor-not-allowed bg-secondary/50 text-muted-foreground',
+   659→                )}
+   660→              >
+   661→                <ArrowUp className="size-[18px]" strokeWidth={2.5} aria-hidden />
+   662→              </motion.button>
+   663→            )}
+   664→          </AnimatePresence>
+   665→        </div>
+   666→
+   667→        {/* Compuerta: cuota agotada → iniciar sesión con Google */}
+   668→        <GuestGateOverlay />
+   669→      </motion.div>
+   670→
+   671→      {/* Diálogos de herramientas IA (Task 19-e) */}
+   672→      <VideoDialog open={videoOpen} onOpenChange={setVideoOpen} chat={chat} />
+   673→      <ImageEditDialog open={imageEditOpen} onOpenChange={setImageEditOpen} chat={chat} />
+   674→      <ReadDocDialog
+   675→        open={readDocOpen}
+   676→        onOpenChange={setReadDocOpen}
+   677→        onConfirm={(doc) => {
+   678→          setPendingDoc(doc)
+   679→          window.dispatchEvent(new Event('oe-focus-composer'))
+   680→        }}
+   681→      />
+   682→
+   683→      <p className="mt-2 text-center text-[11px] text-muted-foreground">
+   684→        Red de {CATALOG.length} modelos trabajando como uno ·{' '}
+   685→        <button type="button" className="rounded font-medium underline decoration-dotted underline-offset-2 hover:text-emerald-300" onClick={() => { setInput('/imagen '); window.dispatchEvent(new Event('oe-focus-composer')) }}>/imagen</button>
+   686→        {' '}para crear imágenes ·{' '}
+   687→        <button type="button" className="rounded font-medium underline decoration-dotted underline-offset-2 hover:text-emerald-300" onClick={() => fileInputRef.current?.click()}>adjunta una imagen</button>
+   688→        {' '}para que la IA la vea · Enter para enviar
+   689→      </p>
+   690→    </div>
+   691→  )
+   692→}
+   693→
+   694→/* Botón con tooltip ligero (title + aria) para el micrófono. */
+   695→function TooltipishButton({
+   696→  label,
+   697→  disabled,
+   698→  active,
+   699→  onClick,
+   700→  children,
+   701→}: {
+   702→  label: string
+   703→  disabled?: boolean
+   704→  active?: boolean
+   705→  onClick: () => void
+   706→  children: React.ReactNode
+   707→}) {
+   708→  return (
+   709→    <button
+   710→      type="button"
+   711→      title={label}
+   712→      aria-label={label}
+   713→      aria-pressed={active}
+   714→      disabled={disabled}
+   715→      onClick={onClick}
+   716→      className={cn(
+   717→        'grid size-10 place-items-center rounded-full border transition-all',
+   718→        active
+   719→          ? 'border-emerald-500/40 bg-emerald-500/15'
+   720→          : 'border-border/60 bg-secondary/40 hover:bg-accent',
+   721→        disabled ? 'cursor-not-allowed opacity-40' : 'hover:scale-105',
+   722→      )}
+   723→    >
+   724→      {children}
+   725→    </button>
+   726→  )
+   727→}
+   728→
+   729→/* Micro con ondas animadas durante el dictado. */
+   730→function MicIcon({ className, listening }: { className?: string; listening?: boolean }) {
+   731→  if (!listening) {
+   732→    return (
+   733→      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden>
+   734→        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+   735→        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+   736→        <line x1="12" x2="12" y1="19" y2="22" />
+   737→      </svg>
+   738→    )
+   739→  }
+   740→  return (
+   741→    <span className={cn('flex items-end gap-[2px]', className)} aria-hidden>
+   742→      <span className="w-[3px] animate-pulse rounded-full bg-emerald-300" style={{ height: 8 }} />
+   743→      <span className="w-[3px] animate-pulse rounded-full bg-emerald-300 [animation-delay:150ms]" style={{ height: 14 }} />
+   744→      <span className="w-[3px] animate-pulse rounded-full bg-emerald-300 [animation-delay:300ms]" style={{ height: 9 }} />
+   745→    </span>
+   746→  )
+   747→}
+   748→

@@ -1,0 +1,591 @@
+     1→     1→/**
+     2→     2→ * Pipeline del Modo Agente de OE AI — TODO REAL, nada simulado.
+     3→     3→ *
+     4→     4→ * Orquesta el turno completo contra núcleos LLM reales y contra la máquina:
+     5→     5→ *   1. Plan (agente planificador → JSON) → se convierte en la lista de Todos
+     6→     6→ *   2. Código (agente de código → archivos completos) → escritura REAL en disco
+     7→     7→ *   3. `bun install` REAL (salida en streaming al terminal)
+     8→     8→ *   4. Servidor `next dev` REAL (puerto propio, salida en streaming)
+     9→     9→ *   5. Verificación REAL de la página (HTTP) + bucle de reparación con el
+    10→    10→ *      Agente Reparador si el servidor devuelve un error real
+    11→    11→ *   6. Resumen final compuesto localmente (sin llamada extra al LLM)
+    12→    12→ *
+    13→    13→ * Cada paso emite eventos SSE (thought / todo / cmd_* / file / preview_status)
+    14→    14→ * y persiste el terminal real en AgentLog. Nada se simula: si un paso falla,
+    15→    15→ * se informa con honestidad y el proyecto queda en 'error' con su progreso.
+    16→    16→ */
+    17→    17→import { db } from '@/lib/db'
+    18→    18→import { AgentLlmError, agentChatJson, type AgentCore } from './llm'
+    19→    19→import {
+    20→    20→  coderSystemPrompt,
+    21→    21→  coderUserPrompt,
+    22→    22→  finalSummaryText,
+    23→    23→  fixerSystemPrompt,
+    24→    24→  fixerUserPrompt,
+    25→    25→  followupSystemPrompt,
+    26→    26→  followupUserPrompt,
+    27→    27→  plannerSystemPrompt,
+    28→    28→  plannerUserPrompt,
+    29→    29→} from './prompts'
+    30→    30→import { BASE_FILES, FALLBACK_FILES } from './base-files'
+    31→    31→import {
+    32→    32→  ensureDevServer,
+    33→    33→  execUserCommand,
+    34→    34→  runCommand,
+    35→    35→  verifyProjectPage,
+    36→    36→  writeProjectFile,
+    37→    37→  type RunLine,
+    38→    38→} from './runner'
+    39→    39→import {
+    40→    40→  languageFromPath,
+    41→    41→  type AgentGeneratedFile,
+    42→    42→  type AgentMode,
+    43→    43→  type AgentPhase,
+    44→    44→  type AgentPlan,
+    45→    45→  type AgentTodo,
+    46→    46→} from './types'
+    47→    47→
+    48→    48→export interface PipelineSend {
+    49→    49→  (event: string, data: unknown): void
+    50→    50→}
+    51→    51→
+    52→    52→const MAX_FIX_ATTEMPTS = 2
+    53→    53→
+    54→    54→function normalizePath(raw: string): string | null {
+    55→    55→  if (typeof raw !== 'string') return null
+    56→    56→  const clean = raw.trim().replace(/^\.\//, '').replace(/^\/+/, '')
+    57→    57→  if (!clean || clean.includes('..') || clean.length > 200) return null
+    58→    58→  return clean
+    59→    59→}
+    60→    60→
+    61→    61→/** Normaliza y valida la lista de archivos del agente de código. */
+    62→    62→function sanitizeFiles(raw: unknown, maxFiles: number): AgentGeneratedFile[] {
+    63→    63→  if (!Array.isArray(raw)) return []
+    64→    64→  const seen = new Set<string>()
+    65→    65→  const out: AgentGeneratedFile[] = []
+    66→    66→  for (const item of raw.slice(0, maxFiles + 4)) {
+    67→    67→    if (!item || typeof item !== 'object') continue
+    68→    68→    const path = normalizePath(String((item as { path?: unknown }).path ?? ''))
+    69→    69→    const content = String((item as { content?: unknown }).content ?? '')
+    70→    70→    if (!path || !content.trim() || seen.has(path)) continue
+    71→    71→    if (path === 'preview.html' || path.startsWith('node_modules')) continue
+    72→    72→    seen.add(path)
+    73→    73→    out.push({ path, content: content.slice(0, 40000) })
+    74→    74→    if (out.length >= maxFiles) break
+    75→    75→  }
+    76→    76→  return out
+    77→    77→}
+    78→    78→
+    79→    79→function asPlan(raw: Record<string, unknown>): AgentPlan {
+    80→    80→  const strArr = (v: unknown, max: number): string[] =>
+    81→    81→    Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x.trim()).slice(0, max).map((s) => String(s).trim()) : []
+    82→    82→
+    83→    83→  const filesRaw = Array.isArray(raw.files) ? raw.files : []
+    84→    84→  const files = filesRaw
+    85→    85→    .slice(0, 14)
+    86→    86→    .map((f) => {
+    87→    87→      const obj = (f ?? {}) as { path?: unknown; purpose?: unknown; language?: unknown }
+    88→    88→      return {
+    89→    89→        path: String(obj.path ?? ''),
+    90→    90→        purpose: String(obj.purpose ?? '').slice(0, 200),
+    91→    91→        language: String(obj.language ?? 'text').slice(0, 20),
+    92→    92→      }
+    93→    93→    })
+    94→    94→    .filter((f) => f.path)
+    95→    95→
+    96→    96→  return {
+    97→    97→    title: String(raw.title ?? 'Proyecto OE AI').slice(0, 80),
+    98→    98→    summary: String(raw.summary ?? '').slice(0, 500),
+    99→    99→    appSlug: String(raw.appSlug ?? 'oe-app')
+   100→   100→      .toLowerCase()
+   101→   101→      .replace(/[^a-z0-9-]+/g, '-')
+   102→   102→      .replace(/^-+|-+$/g, '')
+   103→   103→      .slice(0, 48) || 'oe-app',
+   104→   104→    features: strArr(raw.features, 8),
+   105→   105→    pages: Array.isArray(raw.pages)
+   106→   106→      ? raw.pages.slice(0, 8).map((p) => {
+   107→   107→          const obj = (p ?? {}) as { route?: unknown; purpose?: unknown }
+   108→   108→          return { route: String(obj.route ?? '/').slice(0, 100), purpose: String(obj.purpose ?? '').slice(0, 200) }
+   109→   109→        })
+   110→   110→      : [],
+   111→   111→    apiEndpoints: Array.isArray(raw.apiEndpoints)
+   112→   112→      ? raw.apiEndpoints.slice(0, 8).map((e) => {
+   113→   113→          const obj = (e ?? {}) as { method?: unknown; path?: unknown; purpose?: unknown }
+   114→   114→          return {
+   115→   115→            method: String(obj.method ?? 'GET').slice(0, 8).toUpperCase(),
+   116→   116→            path: String(obj.path ?? '/api').slice(0, 120),
+   117→   117→            purpose: String(obj.purpose ?? '').slice(0, 200),
+   118→   118→          }
+   119→   119→        })
+   120→   120→      : [],
+   121→   121→    files,
+   122→   122→  }
+   123→   123→}
+   124→   124→
+   125→   125→interface TurnSnapshot {
+   126→   126→  todos: AgentTodo[]
+   127→   127→  thoughts: string[]
+   128→   128→  files: string[]
+   129→   129→}
+   130→   130→
+   131→   131→export class AgentPipeline {
+   132→   132→  private todos: AgentTodo[] = []
+   133→   133→  private thoughts: string[] = []
+   134→   134→  private turnFiles: string[] = []
+   135→   135→
+   136→   136→  constructor(
+   137→   137→    private readonly projectId: string,
+   138→   138→    private readonly send: PipelineSend,
+   139→   139→    private readonly signal: AbortSignal,
+   140→   140→  ) {}
+   141→   141→
+   142→   142→  private async log(level: 'info' | 'command' | 'success' | 'warn' | 'error', text: string) {
+   143→   143→    const max = await db.agentLog.aggregate({ _max: { seq: true }, where: { projectId: this.projectId } })
+   144→   144→    const seq = (max._max.seq ?? 0) + 1
+   145→   145→    await db.agentLog.create({ data: { projectId: this.projectId, seq, level, text: text.slice(0, 2000) } })
+   146→   146→    this.send('log', { seq, level, text })
+   147→   147→  }
+   148→   148→
+   149→   149→  private thought(text: string) {
+   150→   150→    this.thoughts.push(text)
+   151→   151→    this.send('thought', { text })
+   152→   152→  }
+   153→   153→
+   154→   154→  private setTodos(todos: AgentTodo[]) {
+   155→   155→    this.todos = todos
+   156→   156→    this.send('todos_reset', { todos })
+   157→   157→  }
+   158→   158→
+   159→   159→  private setTodo(id: string, status: AgentTodo['status']) {
+   160→   160→    this.todos = this.todos.map((t) => (t.id === id ? { ...t, status } : t))
+   161→   161→    this.send('todo', { id, status })
+   162→   162→  }
+   163→   163→
+   164→   164→  private async setPhase(phase: AgentPhase, note?: string) {
+   165→   165→    const status = phase === 'idle' ? 'draft' : phase
+   166→   166→    await db.agentProject.update({ where: { id: this.projectId }, data: { status, errorType: null } })
+   167→   167→    this.send('phase', { phase, note })
+   168→   168→  }
+   169→   169→
+   170→   170→  private snapshot(): TurnSnapshot {
+   171→   171→    return {
+   172→   172→      todos: this.todos,
+   173→   173→      thoughts: [...this.thoughts],
+   174→   174→      files: [...this.turnFiles],
+   175→   175→    }
+   176→   176→  }
+   177→   177→
+   178→   178→  /** Ejecuta un comando REAL registrándolo en el terminal en vivo y persistido. */
+   179→   179→  private async runRealCommand(command: string, opts: { timeoutMs?: number } = {}) {
+   180→   180→    const cmdId = crypto.randomUUID()
+   181→   181→    await this.log('command', command)
+   182→   182→    this.send('cmd_start', { id: cmdId, command, cwd: 'workspace del proyecto' })
+   183→   183→    const result = await runCommand(this.projectId, command, {
+   184→   184→      signal: this.signal,
+   185→   185→      timeoutMs: opts.timeoutMs,
+   186→   186→      onLine: (line: RunLine) => {
+   187→   187→        this.send('cmd_output', { id: cmdId, stream: line.stream, text: line.text })
+   188→   188→        // Persistir salida real (recortada) como log del terminal
+   189→   189→        void this.log(line.stream === 'err' ? 'warn' : 'info', line.text)
+   190→   190→      },
+   191→   191→    })
+   192→   192→    this.send('cmd_end', {
+   193→   193→      id: cmdId,
+   194→   194→      code: result.code,
+   195→   195→      durationMs: result.durationMs,
+   196→   196→      timedOut: result.timedOut,
+   197→   197→    })
+   198→   198→    return result
+   199→   199→  }
+   200→   200→
+   201→   201→  /** Escribe un archivo REAL en disco + base de datos y emite el evento. */
+   202→   202→  private async saveFile(path: string, content: string, action: 'create' | 'update' | 'base') {
+   203→   203→    const bytes = Buffer.byteLength(content, 'utf8')
+   204→   204→    const language = languageFromPath(path)
+   205→   205→    const existing = await db.agentFile.findUnique({
+   206→   206→      where: { projectId_path: { projectId: this.projectId, path } },
+   207→   207→      select: { id: true },
+   208→   208→    })
+   209→   209→    const finalAction = existing ? (action === 'base' ? 'base' : 'update') : 'create'
+   210→   210→    await db.agentFile.upsert({
+   211→   211→      where: { projectId_path: { projectId: this.projectId, path } },
+   212→   212→      create: { projectId: this.projectId, path, content, language, bytes, action: finalAction },
+   213→   213→      update: { content, language, bytes, action: finalAction },
+   214→   214→    })
+   215→   215→    // Escritura REAL en el workspace (servidor next dev la toma en caliente)
+   216→   216→    await writeProjectFile(this.projectId, path, content)
+   217→   217→    this.send('file', { path, language, bytes, action: finalAction, content })
+   218→   218→    if (!this.turnFiles.includes(path)) this.turnFiles.push(path)
+   219→   219→    await this.log('success', `escribir ${path} (${bytes >= 1024 ? `${(bytes / 1024).toFixed(1)} kB` : `${bytes} B`}) · disco`)
+   220→   220→  }
+   221→   221→
+   222→   222→  private aborted(): boolean {
+   223→   223→    return this.signal.aborted
+   224→   224→  }
+   225→   225→
+   226→   226→  /** Ejecuta un turno completo del agente (inicial o de continuación). */
+   227→   227→  async runTurn(opts: { isInitial: boolean; mode: AgentMode; userMessage: string }) {
+   228→   228→    const started = Date.now()
+   229→   229→    const mode = opts.mode
+   230→   230→
+   231→   231→    try {
+   232→   232→      await this.log('command', opts.isInitial
+   233→   233→        ? `iniciar agente (${mode}) · pipeline real: plan → código → bun install → next dev → verificar`
+   234→   234→        : 'iniciar agente (iteración real) sobre el proyecto en disco')
+   235→   235→
+   236→   236→      // ── 1) Plan (solo turno inicial o proyecto sin plan) ────────────────────
+   237→   237→      let plan = await this.loadPlan()
+   238→   238→      if (!plan) {
+   239→   239→        this.setTodos([
+   240→   240→          { id: 'analyze', label: 'Analizar la petición', status: 'in_progress' },
+   241→   241→          { id: 'plan', label: 'Planificar la arquitectura', status: 'pending' },
+   242→   242→          { id: 'code', label: 'Escribir los archivos del proyecto', status: 'pending' },
+   243→   243→          { id: 'install', label: 'Instalar dependencias (bun install real)', status: 'pending' },
+   244→   244→          { id: 'devserver', label: 'Iniciar servidor Next.js real', status: 'pending' },
+   245→   245→          { id: 'verify', label: 'Verificar la página y reparar errores reales', status: 'pending' },
+   246→   246→          { id: 'summary', label: 'Resumen del turno', status: 'pending' },
+   247→   247→        ])
+   248→   248→        this.thought('Voy a analizar tu petición y definir la arquitectura del proyecto Next.js.')
+   249→   249→        this.setTodo('analyze', 'done')
+   250→   250→        this.setTodo('plan', 'in_progress')
+   251→   251→        await this.setPhase('planning')
+   252→   252→        await this.log('info', 'agente planificador analizando la petición')
+   253→   253→        const planner = await agentChatJson<Record<string, unknown>>(
+   254→   254→          plannerSystemPrompt(),
+   255→   255→          plannerUserPrompt(opts.userMessage, mode),
+   256→   256→          this.signal,
+   257→   257→        )
+   258→   258→        this.reportCore(planner.core)
+   259→   259→        if (this.aborted()) return this.finishAborted()
+   260→   260→        plan = asPlan(planner.data)
+   261→   261→        await db.agentProject.update({
+   262→   262→          where: { id: this.projectId },
+   263→   263→          data: { planJson: JSON.stringify(plan), title: plan.title },
+   264→   264→        })
+   265→   265→        this.send('plan', { plan })
+   266→   266→        this.thought(`Plan listo: ${plan.files.length} archivos, ${plan.pages.length} página(s) y ${plan.apiEndpoints.length} endpoint(s). Ahora escribo el código real en el workspace.`)
+   267→   267→        await this.log('success', `plan listo: ${plan.files.length} archivos · ${plan.pages.length} páginas · ${plan.apiEndpoints.length} endpoints`)
+   268→   268→        this.setTodo('plan', 'done')
+   269→   269→      } else {
+   270→   270→        this.setTodos([
+   271→   271→          { id: 'analyze', label: 'Analizar la petición', status: 'in_progress' },
+   272→   272→          { id: 'code', label: 'Aplicar cambios en el código', status: 'pending' },
+   273→   273→          { id: 'devserver', label: 'Compilar y servir (next dev real)', status: 'pending' },
+   274→   274→          { id: 'verify', label: 'Verificar la página y reparar errores reales', status: 'pending' },
+   275→   275→          { id: 'summary', label: 'Resumen del turno', status: 'pending' },
+   276→   276→        ])
+   277→   277→        this.thought('Continúo el proyecto existente: voy a aplicar tu petición sobre los archivos reales en disco.')
+   278→   278→      }
+   279→   279→
+   280→   280→      // ── 2) Código ───────────────────────────────────────────────────────────
+   281→   281→      await this.setPhase('coding')
+   282→   282→      let filesChanged: AgentGeneratedFile[] = []
+   283→   283→      let followUpSummary: string | null = null
+   284→   284→
+   285→   285→      if (!plan) throw new AgentLlmError('El agente no disponía de plan válido.', 'json_parse')
+   286→   286→
+   287→   287→      if (opts.isInitial) {
+   288→   288→        this.setTodo('code', 'in_progress')
+   289→   289→        await this.log('info', 'agente de código implementando los archivos del plan')
+   290→   290→        const coder = await agentChatJson<{ files?: unknown }>(
+   291→   291→          coderSystemPrompt(),
+   292→   292→          coderUserPrompt(JSON.stringify(plan), mode),
+   293→   293→          this.signal,
+   294→   294→        )
+   295→   295→        this.reportCore(coder.core)
+   296→   296→        if (this.aborted()) return this.finishAborted()
+   297→   297→        const files = sanitizeFiles(coder.data.files, mode === 'long' ? 10 : 8)
+   298→   298→        if (files.length === 0) {
+   299→   299→          throw new AgentLlmError('El agente de código no devolvió archivos utilizables.', 'json_parse')
+   300→   300→        }
+   301→   301→        const plannedPaths = new Set(plan.files.map((f) => f.path))
+   302→   302→        const missing = [...plannedPaths].filter((p) => !files.some((f) => f.path === p))
+   303→   303→        if (missing.length) await this.log('warn', `archivos planificados no entregados: ${missing.slice(0, 4).join(', ')}`)
+   304→   304→        filesChanged = files
+   305→   305→      } else {
+   306→   306→        this.setTodo('code', 'in_progress')
+   307→   307→        const project = await db.agentProject.findUnique({ where: { id: this.projectId }, select: { planJson: true } })
+   308→   308→        const existingFiles = await db.agentFile.findMany({ where: { projectId: this.projectId }, select: { path: true } })
+   309→   309→        const recent = await db.agentMessage.findMany({
+   310→   310→          where: { projectId: this.projectId },
+   311→   311→          orderBy: { createdAt: 'desc' },
+   312→   312→          take: 6,
+   313→   313→          select: { role: true, content: true },
+   314→   314→        })
+   315→   315→        const recentTurns = recent
+   316→   316→          .reverse()
+   317→   317→          .map((m) => `${m.role === 'user' ? 'Usuario' : 'Agente'}: ${m.content.slice(0, 220)}`)
+   318→   318→          .join('\n')
+   319→   319→        await this.log('info', 'agente de código aplicando la petición sobre el proyecto existente')
+   320→   320→        const fu = await agentChatJson<{ summary?: unknown; files?: unknown }>(
+   321→   321→          followupSystemPrompt(),
+   322→   322→          followupUserPrompt({
+   323→   323→            planJson: project?.planJson ?? JSON.stringify(plan),
+   324→   324→            filePaths: existingFiles.map((f) => f.path),
+   325→   325→            recentTurns,
+   326→   326→            message: opts.userMessage,
+   327→   327→            mode,
+   328→   328→          }),
+   329→   329→          this.signal,
+   330→   330→        )
+   331→   331→        this.reportCore(fu.core)
+   332→   332→        if (this.aborted()) return this.finishAborted()
+   333→   333→        followUpSummary = String(fu.data.summary ?? 'Cambios aplicados.').slice(0, 400)
+   334→   334→        filesChanged = sanitizeFiles(fu.data.files, 4)
+   335→   335→        if (filesChanged.length === 0) {
+   336→   336→          await this.log('warn', 'la iteración no produjo cambios de archivo')
+   337→   337→        }
+   338→   338→      }
+   339→   339→
+   340→   340→      for (const f of filesChanged) {
+   341→   341→        if (this.aborted()) return this.finishAborted()
+   342→   342→        await this.saveFile(f.path, f.content, 'update')
+   343→   343→      }
+   344→   344→      this.setTodo('code', 'done')
+   345→   345→
+   346→   346→      // Plantilla base real (config Next.js ejecutable) + respaldos mínimos
+   347→   347→      if (opts.isInitial) {
+   348→   348→        this.thought('Añado la plantilla base real: package.json, tsconfig, next.config y configuración de Tailwind 4.')
+   349→   349→        await this.log('info', 'añadiendo plantilla base (package.json, tsconfig, next.config, postcss)')
+   350→   350→        for (const bf of BASE_FILES) await this.saveFile(bf.path, bf.content, 'base')
+   351→   351→        const savedPaths = new Set(filesChanged.map((f) => f.path))
+   352→   352→        for (const fb of FALLBACK_FILES) {
+   353→   353→          if (!savedPaths.has(fb.path)) await this.saveFile(fb.path, fb.content, 'base')
+   354→   354→        }
+   355→   355→      }
+   356→   356→
+   357→   357→      // ── 3) Instalación REAL (solo turno inicial) ────────────────────────────
+   358→   358→      let readyMs: number | undefined
+   359→   359→      if (opts.isInitial) {
+   360→   360→        this.setTodo('install', 'in_progress')
+   361→   361→        await this.setPhase('installing')
+   362→   362→        this.send('preview_status', { status: 'installing', detail: 'bun install en curso' })
+   363→   363→        this.thought('Dependencias listas para instalar: ejecuto `bun install` de verdad y transmito su salida al terminal.')
+   364→   364→        const install = await this.runRealCommand('bun install --prefer-offline --no-progress', { timeoutMs: 240_000 })
+   365→   365→        if (install.code !== 0) {
+   366→   366→          const tail = install.lines.filter((l) => l.stream === 'err').slice(-6).map((l) => l.text).join(' | ')
+   367→   367→          throw new AgentLlmError(
+   368→   368→            `bun install falló (código ${install.code ?? 'nulo'}${install.timedOut ? ', timeout' : ''}). ${tail.slice(0, 300)}`,
+   369→   369→            'provider_error',
+   370→   370→          )
+   371→   371→        }
+   372→   372→        await this.log('success', `bun install completado en ${(install.durationMs / 1000).toFixed(1)} s`)
+   373→   373→        this.setTodo('install', 'done')
+   374→   374→      }
+   375→   375→
+   376→   376→      // ── 4) Servidor Next.js REAL ────────────────────────────────────────────
+   377→   377→      this.setTodo('devserver', 'in_progress')
+   378→   378→      await this.setPhase('starting')
+   379→   379→      this.send('preview_status', { status: 'starting', detail: 'next dev arrancando' })
+   380→   380→      this.thought(opts.isInitial
+   381→   381→        ? 'Ahora arranco el servidor de desarrollo REAL (next dev) del proyecto. Su salida en vivo llega al terminal.'
+   382→   382→        : 'El servidor recogerá los cambios en caliente; verifico que compile y sirva la página actualizada.')
+   383→   383→      const devId = `dev-${this.projectId.slice(0, 8)}`
+   384→   384→      this.send('cmd_start', { id: devId, command: 'next dev --hostname 127.0.0.1 (servidor del proyecto)', cwd: 'workspace del proyecto' })
+   385→   385→      const dev = await ensureDevServer(this.projectId, {
+   386→   386→        signal: this.signal,
+   387→   387→        onLine: (line) => {
+   388→   388→          this.send('cmd_output', { id: devId, stream: line.stream, text: line.text })
+   389→   389→          void this.log(line.stream === 'err' ? 'warn' : 'info', `[next dev] ${line.text}`)
+   390→   390→        },
+   391→   391→      })
+   392→   392→      this.send('cmd_end', { id: devId, code: 0, durationMs: dev.readyMs, timedOut: false })
+   393→   393→      await this.log('success', `next dev activo en el puerto ${dev.port}${dev.alreadyRunning ? ' (reutilizado)' : `, listo en ${(dev.readyMs / 1000).toFixed(1)} s`}`)
+   394→   394→      readyMs = dev.readyMs || undefined
+   395→   395→      this.setTodo('devserver', 'done')
+   396→   396→
+   397→   397→      // ── 5) Verificación REAL + bucle de reparación ──────────────────────────
+   398→   398→      this.setTodo('verify', 'in_progress')
+   399→   399→      await this.setPhase('verifying')
+   400→   400→      let fixAttempts = 0
+   401→   401→      let verification = await verifyProjectPage(this.projectId, dev.port)
+   402→   402→      if (!verification.ok) {
+   403→   403→        this.thought('La verificación real falló. Leo el error real del servidor y activo al Agente Reparador.')
+   404→   404→      }
+   405→   405→      while (!verification.ok && fixAttempts < MAX_FIX_ATTEMPTS && !this.aborted()) {
+   406→   406→        fixAttempts++
+   407→   407→        const errText = verification.errorText ?? `HTTP ${verification.status}`
+   408→   408→        this.send('fix_attempt', { attempt: fixAttempts, error: errText })
+   409→   409→        await this.log('error', `verificación real fallida (intento ${fixAttempts}): ${errText.slice(0, 300)}`)
+   410→   410→        const fixed = await this.repair(errText)
+   411→   411→        if (!fixed.length) break
+   412→   412→        for (const f of fixed) {
+   413→   413→          if (this.aborted()) return this.finishAborted()
+   414→   414→          await this.saveFile(f.path, f.content, 'update')
+   415→   415→        }
+   416→   416→        // El servidor recompila en caliente; esperar antes de reverificar
+   417→   417→        await new Promise((r) => setTimeout(r, 2500))
+   418→   418→        verification = await verifyProjectPage(this.projectId, dev.port)
+   419→   419→      }
+   420→   420→      if (!verification.ok) {
+   421→   421→        throw new AgentLlmError(
+   422→   422→          `La página del proyecto sigue fallando tras ${MAX_FIX_ATTEMPTS} intentos de reparación. Último error real: ${(verification.errorText ?? `HTTP ${verification.status}`).slice(0, 300)}`,
+   423→   423→          'provider_error',
+   424→   424→        )
+   425→   425→      }
+   426→   426→      this.thought('Verificación superada: el servidor respondió correctamente. La vista previa en vivo ya es la app real.')
+   427→   427→      await this.log('success', `página verificada (HTTP ${verification.status}) · vista previa real activa`)
+   428→   428→      this.setTodo('verify', 'done')
+   429→   429→      this.send('preview_status', { status: 'ready', port: dev.port, readyMs })
+   430→   430→
+   431→   431→      // ── 6) Resumen final (compuesto localmente, sin LLM extra) ─────────────
+   432→   432→      this.setTodo('summary', 'in_progress')
+   433→   433→      const savedFiles = await db.agentFile.findMany({
+   434→   434→        where: { projectId: this.projectId, path: { notIn: ['preview.html'] } },
+   435→   435→        select: { path: true, bytes: true },
+   436→   436→        orderBy: { path: 'asc' },
+   437→   437→      })
+   438→   438→      const changedForSummary = filesChanged.length
+   439→   439→        ? filesChanged.map((f) => ({ path: f.path, bytes: Buffer.byteLength(f.content, 'utf8') }))
+   440→   440→        : savedFiles.slice(0, 8)
+   441→   441→      const summary = finalSummaryText({
+   442→   442→        title: plan.title,
+   443→   443→        planSummary: plan.summary,
+   444→   444→        files: changedForSummary,
+   445→   445→        isFollowUp: !opts.isInitial,
+   446→   446→        followUpSummary: followUpSummary ?? undefined,
+   447→   447→        readyMs,
+   448→   448→        fixAttempts,
+   449→   449→        devPort: dev.port,
+   450→   450→      })
+   451→   451→
+   452→   452→      await db.agentProject.update({
+   453→   453→        where: { id: this.projectId },
+   454→   454→        data: { status: 'ready', summaryNote: followUpSummary ?? plan.summary, errorType: null, updatedAt: new Date() },
+   455→   455→      })
+   456→   456→      const snap = this.snapshot()
+   457→   457→      const assistant = await db.agentMessage.create({
+   458→   458→        data: {
+   459→   459→          projectId: this.projectId,
+   460→   460→          role: 'assistant',
+   461→   461→          content: summary,
+   462→   462→          metaJson: JSON.stringify({
+   463→   463→            filesChanged: changedForSummary.map((f) => f.path),
+   464→   464→            latencyMs: Date.now() - started,
+   465→   465→            todos: snap.todos,
+   466→   466→            thoughts: snap.thoughts,
+   467→   467→          }),
+   468→   468→          status: 'ok',
+   469→   469→        },
+   470→   470→      })
+   471→   471→      this.send('message', { id: assistant.id, role: 'assistant', content: summary, metaJson: assistant.metaJson })
+   472→   472→      this.setTodo('summary', 'done')
+   473→   473→      await this.setPhase('ready')
+   474→   474→      await this.log('success', `turno completado en ${((Date.now() - started) / 1000).toFixed(1)} s · todo real: plan, archivos en disco, install, next dev y verificación HTTP`)
+   475→   475→      this.send('done', {
+   476→   476→        projectId: this.projectId,
+   477→   477→        status: 'ready',
+   478→   478→        filesCount: savedFiles.length,
+   479→   479→        latencyMs: Date.now() - started,
+   480→   480→        summaryNote: followUpSummary ?? plan.summary,
+   481→   481→      })
+   482→   482→    } catch (err) {
+   483→   483→      if (this.aborted()) return this.finishAborted()
+   484→   484→      await this.finishError(err)
+   485→   485→    }
+   486→   486→  }
+   487→   487→
+   488→   488→  /** Reparación real: pide al LLM corregir con el error real del servidor. */
+   489→   489→  private async repair(errorText: string): Promise<AgentGeneratedFile[]> {
+   490→   490→    const files = await db.agentFile.findMany({
+   491→   491→      where: { projectId: this.projectId, path: { notIn: ['preview.html'] } },
+   492→   492→      select: { path: true, content: true },
+   493→   493→      orderBy: { path: 'asc' },
+   494→   494→    })
+   495→   495→    // Heurística: incluir archivos que el error menciona + página/layout
+   496→   496→    const lower = errorText.toLowerCase()
+   497→   497→    const mentioned = files.filter((f) => errorText.includes(f.path) || lower.includes(f.path.split('/').pop()?.toLowerCase() ?? '###'))
+   498→   498→    const priority = ['app/page.tsx', 'app/layout.tsx', 'app/globals.css', 'lib/data.ts']
+   499→   499→    const relevant: Array<{ path: string; content: string }> = []
+   500→   500→    for (const p of priority) {
+   501→   501→      const f = files.find((x) => x.path === p)
+   502→   502→      if (f) relevant.push(f)
+   503→   503→    }
+   504→   504→    for (const f of mentioned.slice(0, 3)) {
+   505→   505→      if (!relevant.some((r) => r.path === f.path)) relevant.push(f)
+   506→   506→    }
+   507→   507→    if (relevant.length === 0 && files[0]) relevant.push(files[0])
+   508→   508→
+   509→   509→    const fixer = await agentChatJson<{ files?: unknown; summary?: unknown }>(
+   510→   510→      fixerSystemPrompt(),
+   511→   511→      fixerUserPrompt({
+   512→   512→        error: errorText,
+   513→   513→        filePaths: files.map((f) => f.path),
+   514→   514→        relevantFiles: relevant.slice(0, 3),
+   515→   515→      }),
+   516→   516→      this.signal,
+   517→   517→    )
+   518→   518→    this.reportCore(fixer.core)
+   519→   519→    const fixed = sanitizeFiles(fixer.data.files, 3)
+   520→   520→    if (fixed.length === 0) await this.log('warn', 'el reparador no devolvió archivos utilizables')
+   521→   521→    else this.thought(`Reparación aplicada: ${fixed.map((f) => f.path).join(', ')}. Reverifico contra el servidor real.`)
+   522→   522→    return fixed
+   523→   523→  }
+   524→   524→
+   525→   525→  private reportCore(core: AgentCore) {
+   526→   526→    void this.log('info', `núcleo LLM que respondió: ${core}`)
+   527→   527→  }
+   528→   528→
+   529→   529→  private async finishAborted() {
+   530→   530→    await this.log('warn', 'ejecución interrumpida por el usuario')
+   531→   531→    const filesCount = await db.agentFile.count({ where: { projectId: this.projectId, path: { not: 'preview.html' } } })
+   532→   532→    await db.agentProject.update({
+   533→   533→      where: { id: this.projectId },
+   534→   534→      data: { status: filesCount > 0 ? 'ready' : 'draft', updatedAt: new Date() },
+   535→   535→    })
+   536→   536→    this.send('done', { projectId: this.projectId, status: 'ready', filesCount, latencyMs: 0 })
+   537→   537→  }
+   538→   538→
+   539→   539→  private async finishError(err: unknown) {
+   540→   540→    const isLlm = err instanceof AgentLlmError
+   541→   541→    const errorType = isLlm ? err.errorType : 'provider_error'
+   542→   542→    const message = isLlm
+   543→   543→      ? err.message
+   544→   544→      : 'El agente no pudo completar el turno. Se conserva el progreso real del proyecto en disco.'
+   545→   545→    await this.log('error', `error del agente (${errorType}): ${message}`)
+   546→   546→    await db.agentProject.update({
+   547→   547→      where: { id: this.projectId },
+   548→   548→      data: { status: 'error', errorType, updatedAt: new Date() },
+   549→   549→    })
+   550→   550→    this.send('preview_status', { status: 'error', detail: message.slice(0, 200) })
+   551→   551→    this.send('error', { message, errorType, requestId: this.projectId })
+   552→   552→  }
+   553→   553→
+   554→   554→  private async loadPlan(): Promise<AgentPlan | null> {
+   555→   555→    const project = await db.agentProject.findUnique({ where: { id: this.projectId }, select: { planJson: true } })
+   556→   556→    if (!project?.planJson) return null
+   557→   557→    try {
+   558→   558→      return asPlan(JSON.parse(project.planJson) as Record<string, unknown>)
+   559→   559→    } catch {
+   560→   560→      return null
+   561→   561→    }
+   562→   562→  }
+   563→   563→}
+   564→   564→
+   565→   565→/** Terminal REAL del usuario (usado por la ruta /terminal): ejecuta, persiste y emite. */
+   566→   566→export async function runUserTerminalCommand(
+   567→   567→  projectId: string,
+   568→   568→  command: string,
+   569→   569→  emit: (event: string, data: unknown) => void,
+   570→   570→): Promise<void> {
+   571→   571→  const cmdId = crypto.randomUUID()
+   572→   572→  const max = await db.agentLog.aggregate({ _max: { seq: true }, where: { projectId } })
+   573→   573→  let seq = (max._max.seq ?? 0) + 1
+   574→   574→  const nextSeq = () => seq++
+   575→   575→  const persist = (level: 'info' | 'command' | 'warn' | 'error' | 'success', text: string) => {
+   576→   576→    const s = nextSeq()
+   577→   577→    return db.agentLog.create({ data: { projectId, seq: s, level, text: text.slice(0, 2000) } }).catch(() => undefined)
+   578→   578→  }
+   579→   579→
+   580→   580→  await persist('command', command)
+   581→   581→  emit('cmd_start', { id: cmdId, command, cwd: 'workspace del proyecto' })
+   582→   582→  const result = await execUserCommand(projectId, command, {
+   583→   583→    onLine: (line) => {
+   584→   584→      emit('cmd_output', { id: cmdId, stream: line.stream, text: line.text })
+   585→   585→      void persist(line.stream === 'err' ? 'warn' : 'info', line.text)
+   586→   586→    },
+   587→   587→  })
+   588→   588→  emit('cmd_end', { id: cmdId, code: result.code, durationMs: result.durationMs, timedOut: result.timedOut })
+   589→   589→  await persist(result.code === 0 ? 'success' : 'error', `proceso terminado (código ${result.code ?? 'nulo'}${result.timedOut ? ', timeout' : ''}) en ${(result.durationMs / 1000).toFixed(1)} s`)
+   590→   590→}
+   591→   591→

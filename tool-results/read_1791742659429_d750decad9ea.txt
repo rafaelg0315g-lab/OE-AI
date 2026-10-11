@@ -1,0 +1,1021 @@
+     1→'use client'
+     2→
+     3→/**
+     4→ * useOeChat — lógica del chat premium con OE AI LLM.
+     5→ *
+     6→ * - Comunica con POST /api/chat (SSE: meta → stage/search → delta → done | error).
+     7→ * - El backend entrega la respuesta completa (streaming de tokens no verificado);
+     8→ *   la revelación progresiva es un efecto de presentación local (máquina de
+     9→ *   escribir adaptativa) para una experiencia fluida, sin fingir datos.
+    10→ * - Gestiona historial multi-conversación vía /api/chat/sessions y
+    11→ *   /api/chat/history; herramientas: imágenes (/api/tools/image), búsqueda web
+    12→ *   real con fuentes, edición de mensajes (recorte), renombrar y exportar.
+    13→ */
+    14→import { useCallback, useEffect, useRef, useState } from 'react'
+    15→import { useUiStore, type ConversationSummary } from '@/lib/store/ui-store'
+    16→import { exportMessagesAsMarkdown } from '@/lib/export-chat'
+    17→import { useAuth } from '@/components/auth/auth-provider'
+    18→
+    19→export interface WebSource {
+    20→  name: string
+    21→  url: string
+    22→  hostName: string
+    23→  snippet: string
+    24→  date: string | null
+    25→}
+    26→
+    27→export interface ChatMsgMeta {
+    28→  coreLabel?: string | null
+    29→  routeNote?: string | null
+    30→  providerReportedModel?: string | null
+    31→  latencyMs?: number | null
+    32→  mode?: 'instant' | 'reflective'
+    33→  webSearchUsed?: boolean
+    34→  /** true: el turno analizó una imagen adjuntada (visión). */
+    35→  visionUsed?: boolean
+    36→  /** true: los deltas llegan incrementales en tiempo real (streaming verificado). */
+    37→  streaming?: boolean
+    38→}
+    39→
+    40→export interface ChatMsg {
+    41→  id: string
+    42→  role: 'user' | 'assistant'
+    43→  /** Texto visible (durante la revelación es un prefijo de fullContent). */
+    44→  content: string
+    45→  /** Texto completo recibido del proveedor. */
+    46→  fullContent: string
+    47→  /** true cuando la revelación terminó (render markdown). */
+    48→  complete: boolean
+    49→  meta?: ChatMsgMeta
+    50→  /** Tipo: texto normal o imagen generada por la herramienta del núcleo. */
+    51→  kind?: 'text' | 'image'
+    52→  /** Para kind="image": URL del activo servido por /api/assets/[id]. */
+    53→  assetUrl?: string | null
+    54→  /** Placeholder mientras se genera la imagen. */
+    55→  pendingImage?: boolean
+    56→  /** true: placeholder aurora mientras se genera un video narrado. */
+    57→  pendingVideo?: boolean
+    58→  /** Fuentes web (búsqueda real) adjuntas a la respuesta. */
+    59→  sources?: WebSource[]
+    60→  /** Aviso honesto si la búsqueda web no estuvo disponible. */
+    61→  searchNote?: string | null
+    62→  /** Imagen adjuntada por el usuario (visión): /api/assets/[id]. */
+    63→  attachmentUrl?: string | null
+    64→}
+    65→
+    66→export type ChatPhase = 'idle' | 'thinking' | 'typing'
+    67→
+    68→/** Resultado de las herramientas de medios (el diálogo muestra un toast honesto con él). */
+    69→export type ToolResult = { ok: boolean; error?: string; errorType?: string }
+    70→
+    71→export interface ChatError {
+    72→  message: string
+    73→  errorType?: string
+    74→}
+    75→
+    76→/** Cuota del chat para invitados: 5 chats gratis por sesión de navegador. */
+    77→export interface GuestQuotaState {
+    78→  used: number
+    79→  limit: number
+    80→  remaining: number
+    81→  exhausted: boolean
+    82→}
+    83→
+    84→const ACTIVE_KEY = 'oe-ai-active-session'
+    85→
+    86→function newId(): string {
+    87→  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID()
+    88→  return `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`
+    89→}
+    90→
+    91→export function useOeChat() {
+    92→  const [conversations, setConversations] = useState<ConversationSummary[]>([])
+    93→  const [activeId, setActiveId] = useState<string | null>(null)
+    94→  const [messages, setMessages] = useState<ChatMsg[]>([])
+    95→  const [phase, setPhase] = useState<ChatPhase>('idle')
+    96→  const [error, setError] = useState<ChatError | null>(null)
+    97→  const [routeNote, setRouteNote] = useState<string | null>(null)
+    98→  const [focusModel, setFocusModel] = useState<string | null>(null)
+    99→  const [loadingHistory, setLoadingHistory] = useState(false)
+   100→  const [lastUserMsg, setLastUserMsg] = useState<string | null>(null)
+   101→  const [webSearching, setWebSearching] = useState(false)
+   102→  const [imagePending, setImagePending] = useState(false)
+   103→  const [guestQuota, setGuestQuota] = useState<GuestQuotaState | null>(null)
+   104→  const [guestBlocked, setGuestBlocked] = useState(false)
+   105→
+   106→  const abortRef = useRef<AbortController | null>(null)
+   107→  const rafRef = useRef<number | null>(null)
+   108→  const activeIdRef = useRef<string | null>(null)
+   109→  const pendingRef = useRef(false)
+   110→  const lastOptsRef = useRef<{ webSearch?: boolean; attachment?: { assetId: string; previewUrl: string } }>({})
+   111→  const auth = useAuth()
+   112→
+   113→  useEffect(() => {
+   114→    activeIdRef.current = activeId
+   115→  }, [activeId])
+   116→
+   117→  /** Estado de la cuota (GET /api/chat/quota): nula si hay sesión iniciada.
+   118→   *  IMPORTANTE: envía el token de Supabase cuando existe — sin él el endpoint
+   119→   *  sigue viendo la cookie de invitado agotada y volvía a bloquear a usuarios
+   120→   *  que YA habían iniciado sesión (la respuesta asíncrona reactivaba la
+   121→   *  compuerta después de que el efecto la levantaba). */
+   122→  const refreshQuota = useCallback(async () => {
+   123→    try {
+   124→      const token = await auth.getAccessToken().catch(() => null)
+   125→      const res = await fetch('/api/chat/quota', {
+   126→        cache: 'no-store',
+   127→        ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+   128→      })
+   129→      if (!res.ok) return
+   130→      const data = (await res.json()) as {
+   131→        authenticated: boolean
+   132→        used: number | null
+   133→        limit: number | null
+   134→        remaining: number | null
+   135→        exhausted?: boolean
+   136→      }
+   137→      if (data.authenticated) {
+   138→        setGuestQuota(null)
+   139→        setGuestBlocked(false)
+   140→        return
+   141→      }
+   142→      const state: GuestQuotaState = {
+   143→        used: data.used ?? 0,
+   144→        limit: data.limit ?? 5,
+   145→        remaining: data.remaining ?? 0,
+   146→        exhausted: Boolean(data.exhausted),
+   147→      }
+   148→      setGuestQuota(state)
+   149→      // Con sesión iniciada el servidor ignora la cuota de invitado: nunca bloquear.
+   150→      if (state.exhausted && !auth.user) setGuestBlocked(true)
+   151→    } catch {
+   152→      // sin estado de cuota visible; el servidor seguirá aplicándola
+   153→    }
+   154→  }, [auth])
+   155→
+   156→  // Cuota al arrancar y al cambiar la sesión (login/cierre): tras iniciar sesión
+   157→  // la compuerta se levanta (usuarios verificados: chats ilimitados).
+   158→  useEffect(() => {
+   159→    void refreshQuota()
+   160→    if (auth.user) setGuestBlocked(false)
+   161→  }, [auth.user, refreshQuota])
+   162→
+   163→  // Sincroniza el enfoque de red (chatModel del store) con el estado local,
+   164→  // también cuando cambia estando montado (p. ej. "Usar en el chat" desde Conexiones).
+   165→  useEffect(() => {
+   166→    const syncFocus = (model: string) => {
+   167→      setFocusModel(model && model !== 'auto' ? model : null)
+   168→    }
+   169→    syncFocus(useUiStore.getState().chatModel)
+   170→    return useUiStore.subscribe((state) => syncFocus(state.chatModel))
+   171→  }, [])
+   172→
+   173→  /** Lista de conversaciones para sidebar/buscador. */
+   174→  const refreshConversations = useCallback(async () => {
+   175→    try {
+   176→      const res = await fetch('/api/chat/sessions')
+   177→      if (!res.ok) return
+   178→      const data = (await res.json()) as { sessions?: ConversationSummary[] }
+   179→      if (data.sessions) {
+   180→        setConversations(data.sessions.filter((s) => s.messageCount > 0))
+   181→        useUiStore.getState().setConversations(data.sessions.filter((s) => s.messageCount > 0))
+   182→      }
+   183→    } catch {
+   184→      // sin historial visible; la app sigue funcionando
+   185→    }
+   186→  }, [])
+   187→
+   188→  /** Carga los mensajes de una conversación existente (texto e imágenes). */
+   189→  const loadConversation = useCallback(async (id: string) => {
+   190→    if (pendingRef.current) return
+   191→    setError(null)
+   192→    setRouteNote(null)
+   193→    setLoadingHistory(true)
+   194→    try {
+   195→      const res = await fetch(`/api/chat/history?sessionId=${encodeURIComponent(id)}`)
+   196→      if (!res.ok) return
+   197→      const data = (await res.json()) as { messages?: Array<Record<string, unknown>> }
+   198→      const restored: ChatMsg[] = (data.messages ?? []).map((m) => {
+   199→        const kind = m.kind === 'image' ? 'image' : 'text'
+   200→        const role = m.role === 'user' ? ('user' as const) : ('assistant' as const)
+   201→        let sources: WebSource[] | undefined
+   202→        if (typeof m.sourcesJson === 'string' && m.sourcesJson) {
+   203→          try {
+   204→            const parsed = JSON.parse(m.sourcesJson) as WebSource[]
+   205→            if (Array.isArray(parsed) && parsed.length) sources = parsed
+   206→          } catch {
+   207→            // JSON inválido: se ignora
+   208→          }
+   209→        }
+   210→        return {
+   211→          id: String(m.id),
+   212→          role,
+   213→          content: String(m.content ?? ''),
+   214→          fullContent: String(m.content ?? ''),
+   215→          complete: true,
+   216→          kind,
+   217→          assetUrl: kind === 'image' && typeof m.assetId === 'string' ? `/api/assets/${m.assetId}` : null,
+   218→          attachmentUrl: role === 'user' && typeof m.attachmentAssetId === 'string' ? `/api/assets/${m.attachmentAssetId}` : null,
+   219→          sources,
+   220→          meta: {
+   221→            providerReportedModel: (m.providerReportedModel as string) ?? null,
+   222→            routeNote: (m.resolvedModelId as string) ?? null,
+   223→          },
+   224→        }
+   225→      })
+   226→      setMessages(restored)
+   227→      setActiveId(id)
+   228→      activeIdRef.current = id
+   229→      try {
+   230→        window.localStorage.setItem(ACTIVE_KEY, id)
+   231→      } catch {
+   232→        // almacenamiento no disponible
+   233→      }
+   234→    } finally {
+   235→      setLoadingHistory(false)
+   236→    }
+   237→  }, [])
+   238→
+   239→  // Arranque: historial + restauración de la conversación activa + enfoque desde /apis
+   240→  useEffect(() => {
+   241→    void refreshConversations()
+   242→    let initialId: string | null = null
+   243→    try {
+   244→      initialId = window.localStorage.getItem(ACTIVE_KEY)
+   245→    } catch {
+   246→      // sin almacenamiento
+   247→    }
+   248→    if (initialId) void loadConversation(initialId)
+   249→
+   250→    // Enfoque de red llegado desde el Centro de APIs (/apis)
+   251→    try {
+   252→      const pending = window.sessionStorage.getItem('oe-ai-pending-model')
+   253→      if (pending) {
+   254→        window.sessionStorage.removeItem('oe-ai-pending-model')
+   255→        useUiStore.getState().openChatWithModel(pending)
+   256→      }
+   257→    } catch {
+   258→      // ignorar
+   259→    }
+   260→    const focus = useUiStore.getState().chatModel
+   261→    if (focus && focus !== 'auto') setFocusModel(focus)
+   262→  }, [loadConversation, refreshConversations])
+   263→
+   264→  /** Revelación progresiva (máquina de escribir adaptativa, duración acotada).
+   265→   *  Contenido estructurado (tablas/código): sin typewriter → render Markdown
+   266→   *  inmediato y bien formateado (nunca se ve la sintaxis cruda). */
+   267→  const startTypewriter = useCallback((assistantId: string, full: string) => {
+   268→    if (/```|(^|\n)\s*\|/.test(full)) {
+   269→      setMessages((prev) =>
+   270→        prev.map((m) => (m.id === assistantId ? { ...m, content: full, complete: true } : m)),
+   271→      )
+   272→      setPhase('idle')
+   273→      return
+   274→    }
+   275→    setPhase('typing')
+   276→    const duration = Math.min(2400, Math.max(700, full.length * 4))
+   277→    const start = performance.now()
+   278→    const step = (now: number) => {
+   279→      const p = Math.min(1, (now - start) / duration)
+   280→      const eased = 1 - Math.pow(1 - p, 2.1)
+   281→      const chars = Math.max(1, Math.floor(eased * full.length))
+   282→      setMessages((prev) =>
+   283→        prev.map((m) => (m.id === assistantId ? { ...m, content: full.slice(0, chars) } : m)),
+   284→      )
+   285→      if (p < 1) {
+   286→        rafRef.current = requestAnimationFrame(step)
+   287→      } else {
+   288→        setMessages((prev) =>
+   289→          prev.map((m) => (m.id === assistantId ? { ...m, content: full, complete: true } : m)),
+   290→        )
+   291→        setPhase('idle')
+   292→      }
+   293→    }
+   294→    rafRef.current = requestAnimationFrame(step)
+   295→  }, [])
+   296→
+   297→  /** Envía un mensaje al modelo unificado OE AI LLM (con búsqueda web y/o imagen adjunta opcional). */
+   298→  const send = useCallback(
+   299→    async (
+   300→      rawText: string,
+   301→      opts?: {
+   302→        isRetry?: boolean
+   303→        webSearch?: boolean
+   304→        /** Imagen adjuntada (visión): el núcleo la analiza junto al texto. */
+   305→        attachment?: { assetId: string; previewUrl: string }
+   306→        /** Texto de documento leído (enlace/PDF): contexto efímero del turno. */
+   307→        docContext?: string
+   308→        /** Título del documento leído (se muestra en el prompt de sistema). */
+   309→        docTitle?: string
+   310→      },
+   311→    ) => {
+   312→      const content = rawText.trim()
+   313→      if (!content || pendingRef.current) return
+   314→      const mode = useUiStore.getState().mode
+   315→      const focus = useUiStore.getState().chatModel
+   316→      const webSearch = Boolean(opts?.webSearch)
+   317→      const attachment = opts?.attachment
+   318→      const docContext = typeof opts?.docContext === 'string' ? opts.docContext : undefined
+   319→      const docTitle = typeof opts?.docTitle === 'string' ? opts.docTitle : undefined
+   320→      lastOptsRef.current = { webSearch, attachment }
+   321→
+   322→      // Conversación nueva si no hay una activa
+   323→      let convId = activeIdRef.current
+   324→      if (!convId) {
+   325→        convId = newId()
+   326→        activeIdRef.current = convId
+   327→        setActiveId(convId)
+   328→        try {
+   329→          window.localStorage.setItem(ACTIVE_KEY, convId)
+   330→        } catch {
+   331→          // sin almacenamiento
+   332→        }
+   333→      }
+   334→
+   335→      setError(null)
+   336→      setRouteNote(null)
+   337→      setPhase('thinking')
+   338→      setWebSearching(false)
+   339→      pendingRef.current = true
+   340→      if (!opts?.isRetry) {
+   341→        setLastUserMsg(content)
+   342→        setMessages((prev) => [
+   343→          ...prev,
+   344→          {
+   345→            id: `u-${newId()}`,
+   346→            role: 'user',
+   347→            content,
+   348→            fullContent: content,
+   349→            complete: true,
+   350→            attachmentUrl: attachment?.previewUrl ?? null,
+   351→          },
+   352→        ])
+   353→      }
+   354→
+   355→      const assistantId = `a-${newId()}`
+   356→      setMessages((prev) => [
+   357→        ...prev,
+   358→        { id: assistantId, role: 'assistant', content: '', fullContent: '', complete: false },
+   359→      ])
+   360→
+   361→      const controller = new AbortController()
+   362→      abortRef.current = controller
+   363→      let doneMeta: ChatMsgMeta | null = null
+   364→      let serverStreaming = false
+   365→
+   366→      const handleEvent = (event: string, data: unknown) => {
+   367→        if (event === 'meta') {
+   368→          const meta = data as { routeNote?: string; coreLabel?: string; mode?: 'instant' | 'reflective'; streaming?: boolean }
+   369→          serverStreaming = Boolean(meta.streaming)
+   370→          if (meta.routeNote) setRouteNote(meta.routeNote)
+   371→          setMessages((prev) =>
+   372→            prev.map((m) =>
+   373→              m.id === assistantId
+   374→                ? { ...m, meta: { ...m.meta, coreLabel: meta.coreLabel ?? null, routeNote: meta.routeNote ?? null, mode: meta.mode, streaming: serverStreaming } }
+   375→                : m,
+   376→            ),
+   377→          )
+   378→        } else if (event === 'stage') {
+   379→          const { stage } = data as { stage?: string }
+   380→          if (stage === 'web_search') setWebSearching(true)
+   381→        } else if (event === 'search') {
+   382→          const { sources } = data as { sources?: WebSource[] }
+   383→          setWebSearching(false)
+   384→          setMessages((prev) =>
+   385→            prev.map((m) => (m.id === assistantId ? { ...m, sources: Array.isArray(sources) ? sources : [] } : m)),
+   386→          )
+   387→        } else if (event === 'search_error') {
+   388→          const { message } = data as { message?: string }
+   389→          setWebSearching(false)
+   390→          setMessages((prev) =>
+   391→            prev.map((m) => (m.id === assistantId ? { ...m, searchNote: message ?? 'La búsqueda web no estuvo disponible.' } : m)),
+   392→          )
+   393→        } else if (event === 'delta') {
+   394→          const { text } = data as { text: string }
+   395→          if (serverStreaming) {
+   396→            // Streaming real del proveedor: cada delta es un incremento.
+   397→            setPhase('typing')
+   398→            setMessages((prev) =>
+   399→              prev.map((m) => {
+   400→                if (m.id !== assistantId) return m
+   401→                const full = m.fullContent + text
+   402→                return { ...m, fullContent: full, content: full }
+   403→              }),
+   404→            )
+   405→          } else {
+   406→            // Respuesta única: revelación progresiva local (efecto de presentación).
+   407→            setMessages((prev) =>
+   408→              prev.map((m) => (m.id === assistantId ? { ...m, fullContent: text } : m)),
+   409→            )
+   410→            startTypewriter(assistantId, text)
+   411→          }
+   412→        } else if (event === 'done') {
+   413→          const d = data as { latencyMs?: number; providerReportedModel?: string | null; webSearchUsed?: boolean; visionUsed?: boolean }
+   414→          doneMeta = {
+   415→            latencyMs: d.latencyMs ?? null,
+   416→            providerReportedModel: d.providerReportedModel ?? null,
+   417→            webSearchUsed: Boolean(d.webSearchUsed),
+   418→            visionUsed: Boolean(d.visionUsed),
+   419→          }
+   420→          if (serverStreaming) {
+   421→            setMessages((prev) =>
+   422→              prev.map((m) => (m.id === assistantId ? { ...m, content: m.fullContent, complete: true } : m)),
+   423→            )
+   424→            setPhase('idle')
+   425→          }
+   426→        } else if (event === 'error') {
+   427→          const e = data as { message: string; errorType?: string }
+   428→          setError({ message: e.message, errorType: e.errorType })
+   429→          // Si ya había contenido parcial, se conserva completo; si no, se retira.
+   430→          setMessages((prev) =>
+   431→            prev
+   432→              .map((m) => (m.id === assistantId && m.fullContent ? { ...m, content: m.fullContent, complete: true } : m))
+   433→              .filter((m) => !(m.id === assistantId && !m.fullContent)),
+   434→          )
+   435→          setPhase('idle')
+   436→        }
+   437→      }
+   438→
+   439→      try {
+   440→        const token = await auth.getAccessToken()
+   441→        const res = await fetch('/api/chat', {
+   442→          method: 'POST',
+   443→          headers: {
+   444→            'Content-Type': 'application/json',
+   445→            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+   446→          },
+   447→          body: JSON.stringify({
+   448→            sessionId: convId,
+   449→            message: content,
+   450→            model: focus && focus !== 'auto' ? focus : undefined,
+   451→            allowFallback: true,
+   452→            mode,
+   453→            webSearch,
+   454→            attachmentId: attachment?.assetId,
+   455→            docContext,
+   456→            docTitle,
+   457→          }),
+   458→          signal: controller.signal,
+   459→        })
+   460→
+   461→        if (!res.ok || !res.body) {
+   462→          const data = (await res.json().catch(() => null)) as { error?: string; errorType?: string } | null
+   463→          throw Object.assign(new Error(data?.error ?? `Error ${res.status} al iniciar la conversación.`), {
+   464→            errorType: data?.errorType,
+   465→          })
+   466→        }
+   467→
+   468→        const reader = res.body.getReader()
+   469→        const decoder = new TextDecoder()
+   470→        let buffer = ''
+   471→
+   472→        while (true) {
+   473→          const { done, value } = await reader.read()
+   474→          if (done) break
+   475→          buffer += decoder.decode(value, { stream: true })
+   476→          let sep: number
+   477→          while ((sep = buffer.indexOf('\n\n')) !== -1) {
+   478→            const rawEvent = buffer.slice(0, sep)
+   479→            buffer = buffer.slice(sep + 2)
+   480→            let eventName = 'message'
+   481→            let dataRaw = ''
+   482→            for (const line of rawEvent.split('\n')) {
+   483→              if (line.startsWith('event:')) eventName = line.slice(6).trim()
+   484→              else if (line.startsWith('data:')) dataRaw += line.slice(5).trim()
+   485→            }
+   486→            if (dataRaw) {
+   487→              try {
+   488→                handleEvent(eventName, JSON.parse(dataRaw))
+   489→              } catch {
+   490→                // evento malformado: ignorar de forma segura
+   491→              }
+   492→            }
+   493→          }
+   494→        }
+   495→
+   496→        // Adjuntar metadatos finales (latencia, modelo reportado)
+   497→        if (doneMeta) {
+   498→          const meta = doneMeta as ChatMsgMeta
+   499→          setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, meta: { ...m.meta, ...meta } } : m)))
+   500→        }
+   501→        void refreshConversations()
+   502→        void refreshQuota()
+   503→      } catch (err) {
+   504→        if ((err as Error).name === 'AbortError') {
+   505→          // Cancelación: si ya hay texto, se revela completo; si no, se retira el marcador.
+   506→          setMessages((prev) =>
+   507→            prev
+   508→              .map((m) => (m.id === assistantId && m.fullContent ? { ...m, content: m.fullContent, complete: true } : m))
+   509→              .filter((m) => !(m.id === assistantId && !m.fullContent)),
+   510→          )
+   511→        } else {
+   512→          const e = err as Error & { errorType?: string }
+   513→          if (e.errorType === 'guest_limit_reached') {
+   514→            // Cuota agotada: se activa la compuerta de inicio de sesión (sin error genérico).
+   515→            setGuestBlocked(true)
+   516→            void refreshQuota()
+   517→          } else {
+   518→            setError({ message: e.message, errorType: e.errorType })
+   519→          }
+   520→          setMessages((prev) => prev.filter((m) => m.id !== assistantId))
+   521→        }
+   522→      } finally {
+   523→        abortRef.current = null
+   524→        pendingRef.current = false
+   525→        setWebSearching(false)
+   526→        if (!rafRef.current) setPhase('idle')
+   527→      }
+   528→    },
+   529→    [auth, refreshConversations, refreshQuota, startTypewriter],
+   530→  )
+   531→
+   532→  /** Genera una imagen con la herramienta del núcleo y la inserta en la conversación. */
+   533→  const generateImage = useCallback(
+   534→    async (rawPrompt: string) => {
+   535→      const prompt = rawPrompt.trim()
+   536→      if (!prompt || pendingRef.current) return
+   537→
+   538→      let convId = activeIdRef.current
+   539→      if (!convId) {
+   540→        convId = newId()
+   541→        activeIdRef.current = convId
+   542→        setActiveId(convId)
+   543→        try {
+   544→          window.localStorage.setItem(ACTIVE_KEY, convId)
+   545→        } catch {
+   546→          // sin almacenamiento
+   547→        }
+   548→      }
+   549→
+   550→      setError(null)
+   551→      setRouteNote(null)
+   552→      setPhase('thinking')
+   553→      setImagePending(true)
+   554→      pendingRef.current = true
+   555→      setLastUserMsg(null) // la regeneración de texto no aplica tras una imagen
+   556→      setMessages((prev) => [
+   557→        ...prev,
+   558→        { id: `u-${newId()}`, role: 'user', content: prompt, fullContent: prompt, complete: true },
+   559→      ])
+   560→
+   561→      const placeholderId = `img-${newId()}`
+   562→      setMessages((prev) => [
+   563→        ...prev,
+   564→        { id: placeholderId, role: 'assistant', content: '', fullContent: '', complete: false, kind: 'image', pendingImage: true },
+   565→      ])
+   566→
+   567→      const controller = new AbortController()
+   568→      abortRef.current = controller
+   569→
+   570→      try {
+   571→        const token = await auth.getAccessToken()
+   572→        const res = await fetch('/api/tools/image', {
+   573→          method: 'POST',
+   574→          headers: {
+   575→            'Content-Type': 'application/json',
+   576→            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+   577→          },
+   578→          body: JSON.stringify({ sessionId: convId, prompt }),
+   579→          signal: controller.signal,
+   580→        })
+   581→        const data = (await res.json().catch(() => null)) as {
+   582→          url?: string
+   583→          latencyMs?: number
+   584→          error?: string
+   585→          errorType?: string
+   586→        } | null
+   587→        if (!res.ok || !data?.url) {
+   588→          throw Object.assign(new Error(data?.error ?? `No se pudo generar la imagen (error ${res.status}).`), {
+   589→            errorType: data?.errorType,
+   590→          })
+   591→        }
+   592→        setMessages((prev) =>
+   593→          prev.map((m) =>
+   594→            m.id === placeholderId
+   595→              ? {
+   596→                  ...m,
+   597→                  content: prompt,
+   598→                  fullContent: prompt,
+   599→                  assetUrl: data.url ?? null,
+   600→                  pendingImage: false,
+   601→                  complete: true,
+   602→                  meta: { latencyMs: data.latencyMs ?? null },
+   603→                }
+   604→              : m,
+   605→          ),
+   606→        )
+   607→        void refreshConversations()
+   608→        void refreshQuota()
+   609→      } catch (err) {
+   610→        setMessages((prev) => prev.filter((m) => m.id !== placeholderId))
+   611→        if ((err as Error).name !== 'AbortError') {
+   612→          const e = err as Error & { errorType?: string }
+   613→          if (e.errorType === 'guest_limit_reached') {
+   614→            setGuestBlocked(true)
+   615→            void refreshQuota()
+   616→          } else {
+   617→            setError({ message: e.message, errorType: e.errorType })
+   618→          }
+   619→        }
+   620→      } finally {
+   621→        abortRef.current = null
+   622→        pendingRef.current = false
+   623→        setImagePending(false)
+   624→        setPhase('idle')
+   625→      }
+   626→    },
+   627→    [auth, refreshConversations, refreshQuota],
+   628→  )
+   629→
+   630→  /** Creación de conversación (reutilizado por las herramientas de medios). */
+   631→  function ensureConversation(): string {
+   632→    let convId = activeIdRef.current
+   633→    if (!convId) {
+   634→      convId = newId()
+   635→      activeIdRef.current = convId
+   636→      setActiveId(convId)
+   637→      try {
+   638→        window.localStorage.setItem(ACTIVE_KEY, convId)
+   639→      } catch {
+   640→        // sin almacenamiento
+   641→      }
+   642→    }
+   643→    return convId
+   644→  }
+   645→
+   646→  /**
+   647→   * Genera un vídeo IA (POST /api/tools/video, puede tardar ~1-3 min) y lo
+   648→   * inserta en la conversación. El mensaje del asistente se guarda como
+   649→   * markdown de imagen con la pista `#video` en la URL: el renderer lo
+   650→   * convierte en <video controls> (contrato documentado en markdown.tsx).
+   651→   */
+   652→  const generateVideo = useCallback(
+   653→    async (input: { prompt: string; size?: string; duration?: number; withAudio?: boolean }): Promise<ToolResult> => {
+   654→      const prompt = input.prompt.trim()
+   655→      if (!prompt || pendingRef.current) return { ok: false, error: 'Ya hay una operación en curso.' }
+   656→
+   657→      const convId = ensureConversation()
+   658→
+   659→      setError(null)
+   660→      setRouteNote(null)
+   661→      setPhase('thinking')
+   662→      pendingRef.current = true
+   663→      setLastUserMsg(null)
+   664→      const userLabel = `Generar video: ${prompt}`
+   665→      setMessages((prev) => [
+   666→        ...prev,
+   667→        { id: `u-${newId()}`, role: 'user', content: userLabel, fullContent: userLabel, complete: true },
+   668→      ])
+   669→
+   670→      const placeholderId = `vid-${newId()}`
+   671→      setMessages((prev) => [
+   672→        ...prev,
+   673→        { id: placeholderId, role: 'assistant', content: '', fullContent: '', complete: false, pendingVideo: true },
+   674→      ])
+   675→
+   676→      const controller = new AbortController()
+   677→      abortRef.current = controller
+   678→
+   679→      try {
+   680→        const token = await auth.getAccessToken()
+   681→        const res = await fetch('/api/tools/video', {
+   682→          method: 'POST',
+   683→          headers: {
+   684→            'Content-Type': 'application/json',
+   685→            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+   686→          },
+   687→          body: JSON.stringify({
+   688→            sessionId: convId,
+   689→            prompt,
+   690→            size: input.size ?? '1024x1024',
+   691→            duration: input.duration ?? 5,
+   692→            withAudio: Boolean(input.withAudio),
+   693→          }),
+   694→          signal: controller.signal,
+   695→        })
+   696→        const data = (await res.json().catch(() => null)) as {
+   697→          url?: string
+   698→          durationSeconds?: number
+   699→          latencyMs?: number
+   700→          error?: string
+   701→          errorType?: string
+   702→        } | null
+   703→        if (!res.ok || !data?.url) {
+   704→          throw Object.assign(new Error(data?.error ?? `No se pudo generar el video (error ${res.status}).`), {
+   705→            errorType: data?.errorType,
+   706→          })
+   707→        }
+   708→        const content = `![Video generado](${data.url}#video)`
+   709→        setMessages((prev) =>
+   710→          prev.map((m) =>
+   711→            m.id === placeholderId
+   712→              ? {
+   713→                  ...m,
+   714→                  content,
+   715→                  fullContent: content,
+   716→                  complete: true,
+   717→                  pendingVideo: false,
+   718→                  meta: { latencyMs: data.latencyMs ?? null },
+   719→                }
+   720→              : m,
+   721→          ),
+   722→        )
+   723→        void refreshConversations()
+   724→        void refreshQuota()
+   725→        return { ok: true }
+   726→      } catch (err) {
+   727→        setMessages((prev) => prev.filter((m) => m.id !== placeholderId))
+   728→        if ((err as Error).name === 'AbortError') return { ok: false, error: 'Generación cancelada.' }
+   729→        const e = err as Error & { errorType?: string }
+   730→        if (e.errorType === 'guest_limit_reached') {
+   731→          setGuestBlocked(true)
+   732→          void refreshQuota()
+   733→        } else {
+   734→          setError({ message: e.message, errorType: e.errorType })
+   735→        }
+   736→        return { ok: false, error: e.message, errorType: e.errorType }
+   737→      } finally {
+   738→        abortRef.current = null
+   739→        pendingRef.current = false
+   740→        setPhase('idle')
+   741→      }
+   742→    },
+   743→    [auth, refreshConversations, refreshQuota],
+   744→  )
+   745→
+   746→  /**
+   747→   * Edita una imagen con IA (POST /api/tools/image-edit) y añade el resultado
+   748→   * a la conversación: mensaje del usuario con la imagen de referencia
+   749→   * (attachmentUrl, como visión) y respuesta con el markdown de la imagen.
+   750→   */
+   751→  const generateImageEdit = useCallback(
+   752→    async (input: { imageDataUrl: string; previewUrl: string; prompt: string }): Promise<ToolResult> => {
+   753→      const prompt = input.prompt.trim()
+   754→      if (!prompt || pendingRef.current) return { ok: false, error: 'Ya hay una operación en curso.' }
+   755→
+   756→      // La edición de imagen no persiste en servidor (la ruta /api/tools/image-edit
+   757→      // no guarda mensajes): se asegura conversación activa para el turno local.
+   758→      ensureConversation()
+   759→
+   760→      setError(null)
+   761→      setRouteNote(null)
+   762→      setPhase('thinking')
+   763→      pendingRef.current = true
+   764→      setLastUserMsg(null)
+   765→      setMessages((prev) => [
+   766→        ...prev,
+   767→        {
+   768→          id: `u-${newId()}`,
+   769→          role: 'user',
+   770→          content: `Editar imagen: ${prompt}`,
+   771→          fullContent: `Editar imagen: ${prompt}`,
+   772→          complete: true,
+   773→          attachmentUrl: input.previewUrl,
+   774→        },
+   775→      ])
+   776→
+   777→      const placeholderId = `edt-${newId()}`
+   778→      setMessages((prev) => [
+   779→        ...prev,
+   780→        { id: placeholderId, role: 'assistant', content: '', fullContent: '', complete: false },
+   781→      ])
+   782→
+   783→      const controller = new AbortController()
+   784→      abortRef.current = controller
+   785→
+   786→      try {
+   787→        const token = await auth.getAccessToken()
+   788→        const res = await fetch('/api/tools/image-edit', {
+   789→          method: 'POST',
+   790→          headers: {
+   791→            'Content-Type': 'application/json',
+   792→            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+   793→          },
+   794→          body: JSON.stringify({ image: input.imageDataUrl, prompt }),
+   795→          signal: controller.signal,
+   796→        })
+   797→        const data = (await res.json().catch(() => null)) as {
+   798→          url?: string
+   799→          latencyMs?: number
+   800→          error?: string
+   801→          errorType?: string
+   802→        } | null
+   803→        if (!res.ok || !data?.url) {
+   804→          throw Object.assign(new Error(data?.error ?? `No se pudo editar la imagen (error ${res.status}).`), {
+   805→            errorType: data?.errorType,
+   806→          })
+   807→        }
+   808→        const content = `![Imagen editada](${data.url})`
+   809→        setMessages((prev) =>
+   810→          prev.map((m) =>
+   811→            m.id === placeholderId
+   812→              ? {
+   813→                  ...m,
+   814→                  content,
+   815→                  fullContent: content,
+   816→                  complete: true,
+   817→                  meta: { latencyMs: data.latencyMs ?? null },
+   818→                }
+   819→              : m,
+   820→          ),
+   821→        )
+   822→        void refreshConversations()
+   823→        void refreshQuota()
+   824→        return { ok: true }
+   825→      } catch (err) {
+   826→        setMessages((prev) => prev.filter((m) => m.id !== placeholderId))
+   827→        if ((err as Error).name === 'AbortError') return { ok: false, error: 'Edición cancelada.' }
+   828→        const e = err as Error & { errorType?: string }
+   829→        if (e.errorType === 'guest_limit_reached') {
+   830→          setGuestBlocked(true)
+   831→          void refreshQuota()
+   832→        } else {
+   833→          setError({ message: e.message, errorType: e.errorType })
+   834→        }
+   835→        return { ok: false, error: e.message, errorType: e.errorType }
+   836→      } finally {
+   837→        abortRef.current = null
+   838→        pendingRef.current = false
+   839→        setPhase('idle')
+   840→      }
+   841→    },
+   842→    [auth, refreshConversations, refreshQuota],
+   843→  )
+   844→
+   845→  /** Detiene la generación, la revelación o la herramienta en curso. */
+   846→  const stop = useCallback(() => {
+   847→    abortRef.current?.abort()
+   848→    abortRef.current = null
+   849→    pendingRef.current = false
+   850→    if (rafRef.current !== null) {
+   851→      cancelAnimationFrame(rafRef.current)
+   852→      rafRef.current = null
+   853→    }
+   854→    setPhase('idle')
+   855→    setWebSearching(false)
+   856→    setImagePending(false)
+   857→    setMessages((prev) => prev.map((m) => (m.complete || m.pendingImage ? m : { ...m, content: m.fullContent || m.content, complete: true })))
+   858→  }, [])
+   859→
+   860→  /** Regenera la última respuesta (conserva la búsqueda web y la imagen adjunta del turno). */
+   861→  const regenerate = useCallback(() => {
+   862→    if (!lastUserMsg || pendingRef.current) return
+   863→    // Se elimina la última respuesta asistente incompleta o final
+   864→    setMessages((prev) => {
+   865→      const idx = prev.map((m) => m.role).lastIndexOf('assistant')
+   866→      return idx === -1 ? prev : prev.filter((_, i) => i !== idx)
+   867→    })
+   868→    void send(lastUserMsg, {
+   869→      isRetry: true,
+   870→      webSearch: lastOptsRef.current.webSearch,
+   871→      attachment: lastOptsRef.current.attachment,
+   872→    })
+   873→  }, [lastUserMsg, send])
+   874→
+   875→  /**
+   876→   * Edita un mensaje del usuario: recorta la rama posterior (servidor y cliente)
+   877→   * y reenvía el texto corregido como mensaje nuevo. Si el mensaje original
+   878→   * tenía una imagen adjunta (visión), se reutiliza su attachmentAssetId —
+   879→   * mismo contrato que regenerate, que conserva el adjunto del turno.
+   880→   */
+   881→  const editMessage = useCallback(
+   882→    async (messageId: string, newContent: string) => {
+   883→      const text = newContent.trim()
+   884→      if (!text || pendingRef.current) return
+   885→      const idx = messages.findIndex((m) => m.id === messageId)
+   886→      if (idx === -1 || messages[idx]?.role !== 'user') return
+   887→      const convId = activeIdRef.current
+   888→      if (!convId) return
+   889→
+   890→      // Adjunto de visión conservado: el assetId se deriva de la URL del preview.
+   891→      const original = messages[idx]
+   892→      let attachment: { assetId: string; previewUrl: string } | undefined
+   893→      if (original.attachmentUrl?.startsWith('/api/assets/')) {
+   894→        const assetId = original.attachmentUrl.slice('/api/assets/'.length)
+   895→        if (assetId) attachment = { assetId, previewUrl: original.attachmentUrl }
+   896→      }
+   897→
+   898→      // Recorte en servidor: se conservan solo los mensajes anteriores a la edición.
+   899→      try {
+   900→        await fetch('/api/chat/trim', {
+   901→          method: 'POST',
+   902→          headers: { 'Content-Type': 'application/json' },
+   903→          body: JSON.stringify({ sessionId: convId, keepCount: idx }),
+   904→        })
+   905→      } catch {
+   906→        // si el recorte falla se continúa: la conversación local manda en la vista
+   907→      }
+   908→      setMessages((prev) => prev.slice(0, idx))
+   909→      void send(text, { attachment })
+   910→    },
+   911→    [messages, send],
+   912→  )
+   913→
+   914→  /** Renombra una conversación (PATCH) y actualiza sidebar/buscador. */
+   915→  const renameConversation = useCallback(
+   916→    async (id: string, title: string) => {
+   917→      const clean = title.trim().slice(0, 80)
+   918→      if (!clean) return
+   919→      setConversations((prev) => prev.map((c) => (c.id === id ? { ...c, title: clean } : c)))
+   920→      useUiStore.setState((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? { ...c, title: clean } : c)) }))
+   921→      try {
+   922→        await fetch(`/api/chat/sessions/${encodeURIComponent(id)}`, {
+   923→          method: 'PATCH',
+   924→          headers: { 'Content-Type': 'application/json' },
+   925→          body: JSON.stringify({ title: clean }),
+   926→        })
+   927→      } catch {
+   928→        // el título local se mantiene; el servidor quedará coherente al refrescar
+   929→      }
+   930→      void refreshConversations()
+   931→    },
+   932→    [refreshConversations],
+   933→  )
+   934→
+   935→  /** Exporta la conversación activa como Markdown descargable. */
+   936→  const exportActiveConversation = useCallback(() => {
+   937→    if (messages.length === 0) return
+   938→    const title = conversations.find((c) => c.id === activeId)?.title ?? 'Conversación OE AI'
+   939→    exportMessagesAsMarkdown(title, messages)
+   940→  }, [activeId, conversations, messages])
+   941→
+   942→  /** Nueva conversación (Ctrl+Shift+O). */
+   943→  const newChat = useCallback(() => {
+   944→    if (pendingRef.current) abortRef.current?.abort()
+   945→    activeIdRef.current = null
+   946→    setActiveId(null)
+   947→    setMessages([])
+   948→    setError(null)
+   949→    setRouteNote(null)
+   950→    setLastUserMsg(null)
+   951→    setFocusModel(null)
+   952→    setWebSearching(false)
+   953→    setImagePending(false)
+   954→    try {
+   955→      window.localStorage.removeItem(ACTIVE_KEY)
+   956→      window.sessionStorage.removeItem('oe-ai-pending-model')
+   957→      useUiStore.setState({ chatModel: 'auto' })
+   958→    } catch {
+   959→      // sin almacenamiento
+   960→    }
+   961→  }, [])
+   962→
+   963→  /** Elimina una conversación del historial. */
+   964→  const deleteConversation = useCallback(
+   965→    async (id: string) => {
+   966→      try {
+   967→        await fetch(`/api/chat/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })
+   968→      } catch {
+   969→        // si falla, la lista se refresca igualmente
+   970→      }
+   971→      if (activeIdRef.current === id) newChat()
+   972→      void refreshConversations()
+   973→    },
+   974→    [newChat, refreshConversations],
+   975→  )
+   976→
+   977→  // Limpieza al desmontar
+   978→  useEffect(() => {
+   979→    return () => {
+   980→      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current)
+   981→      abortRef.current?.abort()
+   982→    }
+   983→  }, [])
+   984→
+   985→  const pending = phase !== 'idle'
+   986→
+   987→  return {
+   988→    conversations,
+   989→    activeId,
+   990→    messages,
+   991→    phase,
+   992→    pending,
+   993→    error,
+   994→    routeNote,
+   995→    focusModel,
+   996→    loadingHistory,
+   997→    lastUserMsg,
+   998→    webSearching,
+   999→    imagePending,
+  1000→    guestQuota,
+  1001→    guestBlocked,
+  1002→    refreshQuota,
+  1003→    send,
+  1004→    stop,
+  1005→    regenerate,
+  1006→    newChat,
+  1007→    loadConversation,
+  1008→    deleteConversation,
+  1009→    refreshConversations,
+  1010→    setFocusModel,
+  1011→    generateImage,
+  1012→    generateVideo,
+  1013→    generateImageEdit,
+  1014→    editMessage,
+  1015→    renameConversation,
+  1016→    exportActiveConversation,
+  1017→  }
+  1018→}
+  1019→
+  1020→export type OeChatApi = ReturnType<typeof useOeChat>
+  1021→

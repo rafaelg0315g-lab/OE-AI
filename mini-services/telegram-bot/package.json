@@ -1,0 +1,10 @@
+{
+  "name": "oe-telegram-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bot de Telegram de OE AI: responde en español usando la API pública v1 del propio proyecto (puerto 3005).",
+  "scripts": {
+    "dev": "bun --hot index.ts",
+    "start": "bun index.ts"
+  }
+}

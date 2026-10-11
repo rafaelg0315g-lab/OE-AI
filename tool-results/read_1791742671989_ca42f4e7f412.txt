@@ -1,0 +1,686 @@
+     1→'use client'
+     2→
+     3→/**
+     4→ * Lista de mensajes del chat premium:
+     5→ * - Burbujas del usuario a la derecha, editables (recorta y reenvía).
+     6→ * - Respuestas de OE AI LLM con avatar animado, revelación progresiva con
+     7→ *   cursor, markdown, fuentes de búsqueda web, lectura en voz alta (TTS)
+     8→ *   y acciones (copiar / regenerar / escuchar).
+     9→ * - Imágenes generadas por la herramienta del núcleo con descarga y regenerado.
+    10→ * - Sugerencias de seguimiento y botón flotante «ir al final».
+    11→ */
+    12→import { useEffect, useRef, useState } from 'react'
+    13→import { AnimatePresence, motion } from 'framer-motion'
+    14→import {
+    15→  AlertCircle,
+    16→  ArrowDown,
+    17→  BadgeCheck,
+    18→  Check,
+    19→  Copy,
+    20→  Download,
+    21→  Eye,
+    22→  Globe,
+    23→  ImagePlus,
+    24→  Lightbulb,
+    25→  ListPlus,
+    26→  Pencil,
+    27→  RotateCcw,
+    28→  Square,
+    29→  Waypoints,
+    30→  Volume2,
+    31→} from 'lucide-react'
+    32→import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+    33→import { Badge } from '@/components/ui/badge'
+    34→import { Button } from '@/components/ui/button'
+    35→import { Textarea } from '@/components/ui/textarea'
+    36→import { cn } from '@/lib/utils'
+    37→import { useChat } from './chat-context'
+    38→import type { ChatMsg } from '@/hooks/use-oe-chat'
+    39→import { CanvasPanel } from './canvas-panel'
+    40→import { Markdown } from './markdown'
+    41→import { OeLogo } from './oe-logo'
+    42→import { VideoPendingPlaceholder } from './video-pending-placeholder'
+    43→
+    44→/* ── Lectura en voz alta (una sola reproducción global) ─────────────────── */
+    45→let globalAudio: HTMLAudioElement | null = null
+    46→
+    47→type TtsState = 'idle' | 'loading' | 'playing'
+    48→
+    49→function stopGlobalAudio() {
+    50→  if (globalAudio) {
+    51→    globalAudio.pause()
+    52→    globalAudio.src = ''
+    53→    globalAudio = null
+    54→  }
+    55→}
+    56→
+    57→function SpeakButton({ msg }: { msg: ChatMsg }) {
+    58→  const [state, setState] = useState<TtsState>('idle')
+    59→  const [note, setNote] = useState<string | null>(null)
+    60→
+    61→  // Al desmontar, si este audio es el global activo se detiene.
+    62→  useEffect(() => {
+    63→    return () => {
+    64→      if (globalAudio && globalAudio.dataset.msgId === msg.id) stopGlobalAudio()
+    65→    }
+    66→  }, [msg.id])
+    67→
+    68→  async function toggle() {
+    69→    if (state === 'playing') {
+    70→      stopGlobalAudio()
+    71→      setState('idle')
+    72→      return
+    73→    }
+    74→    if (state === 'loading') return
+    75→    setState('loading')
+    76→    setNote(null)
+    77→    stopGlobalAudio()
+    78→    try {
+    79→      const res = await fetch('/api/tools/tts', {
+    80→        method: 'POST',
+    81→        headers: { 'Content-Type': 'application/json' },
+    82→        body: JSON.stringify({ text: msg.fullContent || msg.content }),
+    83→      })
+    84→      if (!res.ok) {
+    85→        const data = (await res.json().catch(() => null)) as { error?: string } | null
+    86→        throw new Error(data?.error ?? 'No se pudo generar el audio.')
+    87→      }
+    88→      const blob = await res.blob()
+    89→      const audio = new Audio(URL.createObjectURL(blob))
+    90→      audio.dataset.msgId = msg.id
+    91→      globalAudio = audio
+    92→      audio.onended = () => {
+    93→        setState('idle')
+    94→        if (globalAudio === audio) globalAudio = null
+    95→      }
+    96→      audio.onerror = () => setState('idle')
+    97→      setState('playing')
+    98→      void audio.play()
+    99→    } catch (err) {
+   100→      setState('idle')
+   101→      setNote(err instanceof Error ? err.message : 'No se pudo generar el audio.')
+   102→    }
+   103→  }
+   104→
+   105→  const label =
+   106→    state === 'playing'
+   107→      ? 'Detener lectura'
+   108→      : state === 'loading'
+   109→        ? 'Generando audio…'
+   110→        : 'Leer en voz alta (voz premium)'
+   111→
+   112→  return (
+   113→    <>
+   114→      <button
+   115→        type="button"
+   116→        onClick={() => void toggle()}
+   117→        disabled={state === 'loading'}
+   118→        aria-label={label}
+   119→        title={label}
+   120→        className={cn(
+   121→          'inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40',
+   122→          state === 'playing' ? 'text-emerald-300' : 'text-muted-foreground',
+   123→        )}
+   124→      >
+   125→        {state === 'loading' ? (
+   126→          <motion.span
+   127→            aria-hidden
+   128→            animate={{ opacity: [0.4, 1, 0.4] }}
+   129→            transition={{ duration: 1.1, repeat: Infinity }}
+   130→            className="inline-flex"
+   131→          >
+   132→            <Volume2 className="size-3" />
+   133→          </motion.span>
+   134→        ) : state === 'playing' ? (
+   135→          <Square className="size-3 fill-current" aria-hidden />
+   136→        ) : (
+   137→          <Volume2 className="size-3" aria-hidden />
+   138→        )}
+   139→        {state === 'playing' ? 'Detener' : 'Escuchar'}
+   140→      </button>
+   141→      {note && <span className="text-[11px] text-amber-300/90">{note}</span>}
+   142→    </>
+   143→  )
+   144→}
+   145→
+   146→/* ── Lista principal ────────────────────────────────────────────────────── */
+   147→
+   148→const FOLLOW_UPS = [
+   149→  { key: 'example', icon: Lightbulb, label: 'Dame un ejemplo práctico' },
+   150→  { key: 'simpler', icon: ListPlus, label: 'Explícalo más simple' },
+   151→  { key: 'more', icon: ArrowDown, label: 'Profundiza en el tema' },
+   152→] as const
+   153→
+   154→export function MessageList() {
+   155→  const chat = useChat()
+   156→  const bottomRef = useRef<HTMLDivElement | null>(null)
+   157→  const stickRef = useRef(true)
+   158→  const [showJump, setShowJump] = useState(false)
+   159→  /** Código del bloque html abierto en el Canvas (null = cerrado). */
+   160→  const [canvasCode, setCanvasCode] = useState<string | null>(null)
+   161→
+   162→  // Auto-scroll inteligente: solo si el usuario está cerca del final
+   163→  useEffect(() => {
+   164→    const el = bottomRef.current
+   165→    if (!el || !stickRef.current) return
+   166→    el.scrollIntoView({ behavior: 'smooth', block: 'end' })
+   167→  }, [chat.messages, chat.phase])
+   168→
+   169→  function onScroll(e: React.UIEvent<HTMLDivElement>) {
+   170→    const target = e.currentTarget
+   171→    const distance = target.scrollHeight - target.scrollTop - target.clientHeight
+   172→    stickRef.current = distance < 120
+   173→    setShowJump(distance > 420)
+   174→  }
+   175→
+   176→  const lastMsg = chat.messages[chat.messages.length - 1]
+   177→  const showFollowUps =
+   178→    !chat.pending && !chat.error && lastMsg?.role === 'assistant' && lastMsg.complete && !lastMsg.pendingImage
+   179→
+   180→  return (
+   181→    <div className="relative min-h-0 flex-1">
+   182→      <div
+   183→        className="scrollbar-slim mx-auto h-full w-full max-w-3xl overflow-y-auto px-4 pt-6 sm:px-6"
+   184→        onScroll={onScroll}
+   185→        aria-live="polite"
+   186→        aria-label="Conversación con OE AI LLM"
+   187→      >
+   188→        {chat.loadingHistory && (
+   189→          <div className="flex flex-col gap-4 py-6" role="status" aria-label="Cargando conversación">
+   190→            {[0, 1, 2].map((i) => (
+   191→              <div key={i} className={cn('flex', i % 2 ? 'justify-end' : 'justify-start')}>
+   192→                <div className="h-16 w-2/3 animate-pulse rounded-3xl bg-secondary/40" />
+   193→              </div>
+   194→            ))}
+   195→          </div>
+   196→        )}
+   197→
+   198→        <ul className="flex flex-col gap-6 pb-4">
+   199→          {chat.messages.map((m) => (
+   200→            <motion.li
+   201→              key={m.id}
+   202→              initial={{ opacity: 0, y: 12 }}
+   203→              animate={{ opacity: 1, y: 0 }}
+   204→              transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+   205→              className={cn('flex gap-3', m.role === 'user' && 'justify-end')}
+   206→            >
+   207→              {m.role === 'assistant' && <AssistantAvatar thinking={!m.complete} />}
+   208→              <div className={cn('min-w-0', m.role === 'user' ? 'max-w-[85%]' : 'max-w-full flex-1')}>
+   209→                {m.role === 'user' ? (
+   210→                  <UserBubble msg={m} />
+   211→                ) : (
+   212→                  <AssistantContent msg={m} onOpenCanvas={setCanvasCode} />
+   213→                )}
+   214→              </div>
+   215→            </motion.li>
+   216→          ))}
+   217→
+   218→          {/* Error honesto del proveedor con reintento */}
+   219→          {chat.error && (
+   220→            <li>
+   221→              <Alert variant="destructive" role="alert" className="rounded-2xl">
+   222→                <AlertCircle className="size-4" aria-hidden />
+   223→                <AlertTitle>No se pudo completar la respuesta</AlertTitle>
+   224→                <AlertDescription className="flex flex-col gap-2 text-xs leading-relaxed">
+   225→                  <span>{chat.error.message}</span>
+   226→                  {chat.lastUserMsg && (
+   227→                    <Button
+   228→                      size="sm"
+   229→                      variant="outline"
+   230→                      className="w-fit gap-1.5"
+   231→                      onClick={chat.regenerate}
+   232→                      disabled={chat.pending}
+   233→                    >
+   234→                      <RotateCcw className="size-3.5" aria-hidden />
+   235→                      Reintentar
+   236→                    </Button>
+   237→                  )}
+   238→                </AlertDescription>
+   239→              </Alert>
+   240→            </li>
+   241→          )}
+   242→
+   243→          {/* Sugerencias de seguimiento */}
+   244→          <AnimatePresence>
+   245→            {showFollowUps && (
+   246→              <motion.li
+   247→                initial={{ opacity: 0, y: 8 }}
+   248→                animate={{ opacity: 1, y: 0 }}
+   249→                exit={{ opacity: 0 }}
+   250→                transition={{ duration: 0.35, delay: 0.15 }}
+   251→              >
+   252→                <div className="flex flex-wrap items-center gap-2 pl-10" aria-label="Sugerencias de seguimiento">
+   253→                  {FOLLOW_UPS.map((f) => (
+   254→                    <button
+   255→                      key={f.key}
+   256→                      type="button"
+   257→                      onClick={() => void chat.send(f.label)}
+   258→                      className="flex items-center gap-1.5 rounded-full border border-border/60 bg-secondary/30 px-3 py-1.5 text-xs font-medium text-foreground/80 transition-all hover:scale-[1.03] hover:border-emerald-500/40 hover:bg-emerald-500/10 hover:text-foreground"
+   259→                    >
+   260→                      <f.icon className="size-3.5 text-emerald-300" aria-hidden />
+   261→                      {f.label}
+   262→                    </button>
+   263→                  ))}
+   264→                </div>
+   265→              </motion.li>
+   266→            )}
+   267→          </AnimatePresence>
+   268→
+   269→          <div ref={bottomRef} aria-hidden />
+   270→        </ul>
+   271→      </div>
+   272→
+   273→      {/* Canvas: vista previa en vivo de bloques html (estilo Artifacts) */}
+   274→      <CanvasPanel
+   275→        open={canvasCode !== null}
+   276→        onOpenChange={(o) => {
+   277→          if (!o) setCanvasCode(null)
+   278→        }}
+   279→        code={canvasCode ?? ''}
+   280→      />
+   281→
+   282→      {/* Botón flotante: ir al final */}
+   283→      <AnimatePresence>
+   284→        {showJump && (
+   285→          <motion.button
+   286→            type="button"
+   287→            initial={{ opacity: 0, y: 8, scale: 0.9 }}
+   288→            animate={{ opacity: 1, y: 0, scale: 1 }}
+   289→            exit={{ opacity: 0, y: 8, scale: 0.9 }}
+   290→            onClick={() => {
+   291→              stickRef.current = true
+   292→              bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+   293→            }}
+   294→            aria-label="Ir al final de la conversación"
+   295→            className="absolute bottom-4 right-4 z-10 grid size-10 place-items-center rounded-full border border-border/70 bg-background/85 text-muted-foreground shadow-lg backdrop-blur transition-colors hover:text-foreground"
+   296→          >
+   297→            <ArrowDown className="size-4" aria-hidden />
+   298→          </motion.button>
+   299→        )}
+   300→      </AnimatePresence>
+   301→    </div>
+   302→  )
+   303→}
+   304→
+   305→/* ── Burbuja del usuario con edición ────────────────────────────────────── */
+   306→
+   307→function UserBubble({ msg }: { msg: ChatMsg }) {
+   308→  const chat = useChat()
+   309→  const [editing, setEditing] = useState(false)
+   310→  const [draft, setDraft] = useState(msg.content)
+   311→
+   312→  function save() {
+   313→    const text = draft.trim()
+   314→    setEditing(false)
+   315→    if (!text || text === msg.content) return
+   316→    void chat.editMessage(msg.id, text)
+   317→  }
+   318→
+   319→  if (editing) {
+   320→    return (
+   321→      <div className="w-full min-w-[240px] rounded-3xl rounded-br-lg border border-emerald-500/40 bg-secondary/60 p-3">
+   322→        <label htmlFor={`edit-${msg.id}`} className="sr-only">
+   323→          Editar mensaje
+   324→        </label>
+   325→        <Textarea
+   326→          id={`edit-${msg.id}`}
+   327→          value={draft}
+   328→          onChange={(e) => setDraft(e.target.value)}
+   329→          onKeyDown={(e) => {
+   330→            if (e.key === 'Enter' && !e.shiftKey) {
+   331→              e.preventDefault()
+   332→              save()
+   333→            }
+   334→            if (e.key === 'Escape') setEditing(false)
+   335→          }}
+   336→          rows={3}
+   337→          autoFocus
+   338→          className="scrollbar-slim min-h-0 w-full resize-none border-0 bg-transparent px-0 py-0 text-sm leading-relaxed shadow-none focus-visible:ring-0 dark:bg-transparent"
+   339→        />
+   340→        <div className="mt-2 flex items-center justify-end gap-2">
+   341→          <Button size="sm" variant="ghost" onClick={() => setEditing(false)}>
+   342→            Cancelar
+   343→          </Button>
+   344→          <Button size="sm" className="gap-1.5" onClick={save} disabled={!draft.trim() || chat.pending}>
+   345→            <Check className="size-3.5" aria-hidden />
+   346→            Guardar y regenerar
+   347→          </Button>
+   348→        </div>
+   349→      </div>
+   350→    )
+   351→  }
+   352→
+   353→  return (
+   354→    <div className="group/user flex flex-col items-end gap-1">
+   355→      {/* Imagen adjuntada por el usuario (turno de visión) */}
+   356→      {msg.attachmentUrl && (
+   357→        <a
+   358→          href={msg.attachmentUrl}
+   359→          target="_blank"
+   360→          rel="noreferrer"
+   361→          aria-label="Abrir imagen adjunta en tamaño completo"
+   362→          className="block max-w-[85%] overflow-hidden rounded-3xl rounded-br-lg ring-1 ring-border/60 transition-shadow hover:ring-emerald-500/40"
+   363→        >
+   364→          <img
+   365→            src={msg.attachmentUrl}
+   366→            alt={msg.content ? `Imagen adjunta: ${msg.content}` : 'Imagen adjunta por el usuario'}
+   367→            className="max-h-56 w-auto max-w-full bg-secondary/30"
+   368→            loading="lazy"
+   369→          />
+   370→        </a>
+   371→      )}
+   372→      {msg.content && (
+   373→        <div className="rounded-3xl rounded-br-lg bg-primary/15 px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap break-words text-foreground ring-1 ring-primary/20">
+   374→          {msg.content}
+   375→        </div>
+   376→      )}
+   377→      <button
+   378→        type="button"
+   379→        onClick={() => {
+   380→          setDraft(msg.content)
+   381→          setEditing(true)
+   382→        }}
+   383→        disabled={chat.pending}
+   384→        aria-label="Editar mensaje y reenviar"
+   385→        title="Editar y reenviar"
+   386→        className="mr-1 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-foreground focus-visible:opacity-100 group-hover/user:opacity-100 disabled:pointer-events-none [@media(pointer:coarse)]:opacity-100"
+   387→      >
+   388→        <Pencil className="size-3" aria-hidden />
+   389→        Editar
+   390→      </button>
+   391→    </div>
+   392→  )
+   393→}
+   394→
+   395→/* ── Respuesta del asistente ────────────────────────────────────────────── */
+   396→
+   397→function AssistantAvatar({ thinking }: { thinking: boolean }) {
+   398→  return (
+   399→    <span className="relative mt-0.5 shrink-0">
+   400→      <OeLogo size="sm" animated={thinking} />
+   401→      {thinking && (
+   402→        <motion.span
+   403→          aria-hidden
+   404→          className="absolute -inset-1 rounded-[30%] border border-emerald-400/50"
+   405→          animate={{ scale: [1, 1.25, 1], opacity: [0.7, 0, 0.7] }}
+   406→          transition={{ duration: 1.6, repeat: Infinity, ease: 'easeInOut' }}
+   407→        />
+   408→      )}
+   409→    </span>
+   410→  )
+   411→}
+   412→
+   413→function AssistantContent({ msg, onOpenCanvas }: { msg: ChatMsg; onOpenCanvas: (code: string) => void }) {
+   414→  const chat = useChat()
+   415→
+   416→  // Estado "Pensando…" (esperando al proveedor)
+   417→  if (msg.pendingImage) {
+   418→    return (
+   419→      <div className="w-full max-w-sm">
+   420→        <div className="oe-shimmer flex aspect-square w-full items-center justify-center rounded-2xl border border-border/60 bg-secondary/40">
+   421→          <div className="flex flex-col items-center gap-2 text-sm text-muted-foreground">
+   422→            <ImagePlus className="size-6 text-emerald-300" aria-hidden />
+   423→            <span>Generando imagen…</span>
+   424→          </div>
+   425→        </div>
+   426→      </div>
+   427→    )
+   428→  }
+   429→
+   430→  // Placeholder "aurora de puntos" mientras se genera el video narrado.
+   431→  if (msg.pendingVideo) {
+   432→    return (
+   433→      <div className="w-full max-w-[270px]">
+   434→        <VideoPendingPlaceholder />
+   435→      </div>
+   436→    )
+   437→  }
+   438→
+   439→  if (!msg.content && !msg.fullContent && msg.kind !== 'image') {
+   440→    return (
+   441→      <div className="flex h-[38px] items-center gap-2.5 rounded-2xl px-1">
+   442→        <span className="oe-shimmer text-sm font-medium">
+   443→          {chat.webSearching ? 'Buscando en la web' : 'OE AI LLM está pensando'}
+   444→        </span>
+   445→        <span className="flex gap-1" aria-hidden>
+   446→          {[0, 1, 2].map((i) => (
+   447→            <motion.span
+   448→              key={i}
+   449→              className="size-1.5 rounded-full bg-emerald-400/80"
+   450→              animate={{ y: [0, -4, 0], opacity: [0.5, 1, 0.5] }}
+   451→              transition={{ duration: 0.9, repeat: Infinity, delay: i * 0.15 }}
+   452→            />
+   453→          ))}
+   454→        </span>
+   455→      </div>
+   456→    )
+   457→  }
+   458→
+   459→  if (msg.kind === 'image') {
+   460→    return <ImageContent msg={msg} />
+   461→  }
+   462→
+   463→  return (
+   464→    <div className="group/msg">
+   465→      <div className="rounded-2xl rounded-tl-lg bg-secondary/50 px-4 py-3 ring-1 ring-border/50">
+   466→        {/* Markdown SIEMPRE: el revelado progresivo también se parsea, así las
+   467→            tablas, negritas y listas se ven formateadas desde el primer frame
+   468→            (sin mostrar nunca la sintaxis cruda). */}
+   469→        <div className={cn(!msg.complete && 'oe-caret')}>
+   470→          <Markdown content={msg.content} onOpenCanvas={onOpenCanvas} />
+   471→        </div>
+   472→      </div>
+   473→
+   474→      {/* Aviso honesto: la búsqueda web no estuvo disponible */}
+   475→      {msg.searchNote && (
+   476→        <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-amber-300/90" role="status">
+   477→          <AlertCircle className="size-3" aria-hidden />
+   478→          {msg.searchNote}
+   479→        </p>
+   480→      )}
+   481→
+   482→      {/* Fuentes web reales usadas para responder */}
+   483→      {msg.sources && msg.sources.length > 0 && (
+   484→        <div className="mt-2 rounded-xl border border-border/50 bg-secondary/25 px-3 py-2.5">
+   485→          <p className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
+   486→            <Globe className="size-3 text-emerald-300" aria-hidden />
+   487→            Fuentes web ({msg.sources.length})
+   488→          </p>
+   489→          <ol className="flex flex-col gap-1">
+   490→            {msg.sources.map((s, i) => (
+   491→              <li key={`${s.url}-${i}`} className="min-w-0 text-xs leading-snug">
+   492→                <a
+   493→                  href={s.url}
+   494→                  target="_blank"
+   495→                  rel="noreferrer"
+   496→                  className="inline-flex max-w-full items-baseline gap-1.5 rounded text-foreground/80 transition-colors hover:text-emerald-300"
+   497→                  title={s.snippet || s.name}
+   498→                >
+   499→                  <span className="font-mono text-[10px] text-muted-foreground">[{i + 1}]</span>
+   500→                  <span className="truncate font-medium">{s.name}</span>
+   501→                  <span className="shrink-0 text-[10px] text-muted-foreground">— {s.hostName}</span>
+   502→                </a>
+   503→              </li>
+   504→            ))}
+   505→          </ol>
+   506→        </div>
+   507→      )}
+   508→
+   509→      {/* Meta: orquestador, latencia, acciones */}
+   510→      {msg.complete && (
+   511→        <div className="mt-1.5 flex flex-wrap items-center gap-1.5 opacity-70 transition-opacity group-hover/msg:opacity-100">
+   512→          <Badge variant="outline" className="gap-1 border-border/60 text-[10px] text-muted-foreground">
+   513→            <Waypoints className="size-3 text-emerald-400" aria-hidden />
+   514→            {msg.meta?.coreLabel ? `OE AI LLM · Núcleo ${msg.meta.coreLabel}` : 'OE AI LLM'}
+   515→          </Badge>
+   516→          {msg.meta?.webSearchUsed && (
+   517→            <Badge variant="outline" className="gap-1 border-emerald-500/30 text-[10px] text-emerald-300">
+   518→              <Globe className="size-3" aria-hidden />
+   519→              Búsqueda web
+   520→            </Badge>
+   521→          )}
+   522→          {msg.meta?.visionUsed && (
+   523→            <Badge variant="outline" className="gap-1 border-emerald-500/30 text-[10px] text-emerald-300">
+   524→              <Eye className="size-3" aria-hidden />
+   525→              Visión
+   526→            </Badge>
+   527→          )}
+   528→          {typeof msg.meta?.latencyMs === 'number' && msg.meta.latencyMs > 0 && (
+   529→            <Badge variant="outline" className="border-border/60 text-[10px] text-muted-foreground">
+   530→              {(msg.meta.latencyMs / 1000).toFixed(1)} s
+   531→            </Badge>
+   532→          )}
+   533→          {msg.meta?.mode === 'reflective' && (
+   534→            <Badge variant="outline" className="border-emerald-500/30 text-[10px] text-emerald-300">
+   535→              Reflexivo
+   536→            </Badge>
+   537→          )}
+   538→          <CopyTextButton text={msg.fullContent} label="Copiar respuesta" />
+   539→          <button
+   540→            type="button"
+   541→            onClick={chat.regenerate}
+   542→            disabled={chat.pending}
+   543→            aria-label="Regenerar respuesta"
+   544→            className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
+   545→          >
+   546→            <RotateCcw className="size-3" aria-hidden />
+   547→            Regenerar
+   548→          </button>
+   549→          <SpeakButton msg={msg} />
+   550→        </div>
+   551→      )}
+   552→    </div>
+   553→  )
+   554→}
+   555→
+   556→/* ── Imagen generada ────────────────────────────────────────────────────── */
+   557→
+   558→function ImageContent({ msg }: { msg: ChatMsg }) {
+   559→  const chat = useChat()
+   560→  const [copied, setCopied] = useState(false)
+   561→  const caption = msg.content
+   562→
+   563→  return (
+   564→    <div className="group/img max-w-md">
+   565→      {msg.assetUrl ? (
+   566→        <a
+   567→          href={msg.assetUrl}
+   568→          target="_blank"
+   569→          rel="noreferrer"
+   570→          aria-label="Abrir imagen generada en tamaño completo"
+   571→          className="block overflow-hidden rounded-2xl ring-1 ring-border/60 transition-shadow hover:ring-emerald-500/40"
+   572→        >
+   573→          {/* Alt descriptivo: el prompt real, no texto genérico */}
+   574→          <img
+   575→            src={msg.assetUrl}
+   576→            alt={caption ? `Imagen generada: ${caption}` : 'Imagen generada por OE AI LLM'}
+   577→            className="w-full bg-secondary/30"
+   578→            loading="lazy"
+   579→          />
+   580→        </a>
+   581→      ) : (
+   582→        <div className="flex aspect-square w-full items-center justify-center rounded-2xl border border-border/60 bg-secondary/40 text-sm text-muted-foreground">
+   583→          Imagen no disponible
+   584→        </div>
+   585→      )}
+   586→
+   587→      {caption && (
+   588→        <p className="mt-1.5 line-clamp-2 px-0.5 text-[11px] leading-snug text-muted-foreground" title={caption}>
+   589→          {caption}
+   590→        </p>
+   591→      )}
+   592→
+   593→      <div className="mt-1 flex flex-wrap items-center gap-1.5 opacity-70 transition-opacity group-hover/img:opacity-100">
+   594→        {typeof msg.meta?.latencyMs === 'number' && msg.meta.latencyMs > 0 && (
+   595→          <Badge variant="outline" className="gap-1 border-border/60 text-[10px] text-muted-foreground">
+   596→            <BadgeCheck className="size-3 text-emerald-400" aria-hidden />
+   597→            Imagen · {(msg.meta.latencyMs / 1000).toFixed(1)} s
+   598→          </Badge>
+   599→        )}
+   600→        {msg.assetUrl && (
+   601→          <a
+   602→            href={msg.assetUrl}
+   603→            download
+   604→            aria-label="Descargar imagen"
+   605→            className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+   606→          >
+   607→            <Download className="size-3" aria-hidden />
+   608→            Descargar
+   609→          </a>
+   610→        )}
+   611→        {caption && (
+   612→          <button
+   613→            type="button"
+   614→            onClick={() => {
+   615→              void navigator.clipboard.writeText(caption).then(() => {
+   616→                setCopied(true)
+   617→                window.setTimeout(() => setCopied(false), 1600)
+   618→              })
+   619→            }}
+   620→            aria-label="Copiar descripción de la imagen"
+   621→            className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+   622→          >
+   623→            {copied ? <Check className="size-3" aria-hidden /> : <Copy className="size-3" aria-hidden />}
+   624→            {copied ? 'Copiado' : 'Copiar prompt'}
+   625→          </button>
+   626→        )}
+   627→        <button
+   628→          type="button"
+   629→          onClick={() => void chat.generateImage(caption)}
+   630→          disabled={chat.pending || !caption}
+   631→          aria-label="Generar otra imagen con la misma descripción"
+   632→          className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
+   633→        >
+   634→          <RotateCcw className="size-3" aria-hidden />
+   635→          Volver a generar
+   636→        </button>
+   637→      </div>
+   638→    </div>
+   639→  )
+   640→}
+   641→
+   642→/* ── Copiar genérico ────────────────────────────────────────────────────── */
+   643→
+   644→function CopyTextButton({ text, label }: { text: string; label: string }) {
+   645→  const [copied, setCopied] = useState(false)
+   646→  return (
+   647→    <button
+   648→      type="button"
+   649→      onClick={() => {
+   650→        void navigator.clipboard.writeText(text).then(() => {
+   651→          setCopied(true)
+   652→          window.setTimeout(() => setCopied(false), 1600)
+   653→        })
+   654→      }}
+   655→      aria-label={label}
+   656→      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+   657→    >
+   658→      {copied ? <Check className="size-3" aria-hidden /> : <Copy className="size-3" aria-hidden />}
+   659→      {copied ? 'Copiado' : 'Copiar'}
+   660→    </button>
+   661→  )
+   662→}
+   663→
+   664→/** Nota de enrutamiento del orquestador (mostrada bajo el composer). */
+   665→export function RouteNote() {
+   666→  const chat = useChat()
+   667→  return (
+   668→    <AnimatePresence>
+   669→      {chat.routeNote && !chat.error && (
+   670→        <motion.div
+   671→          initial={{ opacity: 0, y: 6 }}
+   672→          animate={{ opacity: 1, y: 0 }}
+   673→          exit={{ opacity: 0, y: -6 }}
+   674→          className="mx-auto mb-2 flex w-fit max-w-full items-center gap-2 rounded-full border border-emerald-500/25 bg-emerald-500/8 px-3.5 py-1.5 text-[11px] text-emerald-200/90"
+   675→          role="status"
+   676→        >
+   677→          <Waypoints className="size-3.5 shrink-0 text-emerald-400" aria-hidden />
+   678→          <span className="truncate" title={chat.routeNote}>
+   679→            {chat.routeNote}
+   680→          </span>
+   681→        </motion.div>
+   682→      )}
+   683→    </AnimatePresence>
+   684→  )
+   685→}
+   686→

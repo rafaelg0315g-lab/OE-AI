@@ -1,0 +1,694 @@
+     1→/**
+     2→ * OE AI LLM — Servicio de voz en tiempo real (puerto 3010)
+     3→ *
+     4→ * Pipeline: Voz ➡️ Texto ➡️ IA ➡️ Voz, en milisegundos:
+     5→ *  1. El navegador envía el micrófono en chunks PCM16 (~100 ms) por WebSocket.
+     6→ *  2. El servidor ejecuta VAD (detección de silencio): corta la frase sola.
+     7→ *  3. ASR del núcleo transcribe el audio → texto.
+     8→ *  4. El texto entra a /api/chat (OE AI LLM, red unificada) por SSE.
+     9→ *  5. Conforme llegan los primeros tokens, cada frase se envía a TTS en
+    10→ *     streaming (ElevenLabs, respaldo z-ai) y el audio viaja de vuelta por
+    11→ *     el mismo WebSocket — la voz empieza ANTES de que la respuesta termine.
+    12→ *
+    13→ * Autenticidad: usa las cookies del navegador (cuota de invitado) y el token
+    14→ * Supabase si existe; consume exactamente la misma cuota que el chat escrito.
+    15→ */
+    16→import { createServer } from 'http'
+    17→import { Server, type Socket } from 'socket.io'
+    18→
+    19→/* ── Entorno: lee el .env raíz del proyecto (clave ElevenLabs, etc.) ────── */
+    20→async function loadRootEnv() {
+    21→  try {
+    22→    const raw = await Bun.file('/home/z/my-project/.env').text()
+    23→    for (const line of raw.split('\n')) {
+    24→      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/)
+    25→      if (!m) continue
+    26→      // Las claves de ElevenLabs SIEMPRE se toman del .env (rotación de claves
+    27→      // sin reinicios intermedios); el resto solo si no viene del proceso.
+    28→      const override = m[1].startsWith('ELEVENLABS_')
+    29→      if (override || process.env[m[1]] === undefined) {
+    30→        process.env[m[1]] = m[2].replace(/^["']|["']$/g, '')
+    31→      }
+    32→    }
+    33→  } catch {
+    34→    console.log('[voice] sin .env raíz; se usan variables de entorno existentes')
+    35→  }
+    36→}
+    37→await loadRootEnv()
+    38→
+    39→const PORT = 3010
+    40→const CHAT_URL = 'http://localhost:3000/api/chat'
+    41→
+    42→/* ── SDK del núcleo (ASR y TTS de respaldo) ─────────────────────────────── */
+    43→type ZaiClient = {
+    44→  audio: {
+    45→    asr: { create: (args: { file_base64: string }) => Promise<{ text?: string }> }
+    46→    tts: {
+    47→      create: (args: {
+    48→        input: string
+    49→        voice: string
+    50→        speed?: number
+    51→        response_format: string
+    52→        stream: boolean
+    53→      }) => Promise<Response>
+    54→    }
+    55→  }
+    56→}
+    57→let zaiPromise: Promise<ZaiClient> | null = null
+    58→async function getZai(): Promise<ZaiClient> {
+    59→  if (!zaiPromise) {
+    60→    zaiPromise = import('z-ai-web-dev-sdk').then(async (mod) => {
+    61→      const zai = (await mod.default.create()) as unknown as ZaiClient
+    62→      console.log('[voice] SDK del núcleo listo (ASR + TTS de respaldo)')
+    63→      return zai
+    64→    })
+    65→  }
+    66→  return zaiPromise
+    67→}
+    68→void getZai()
+    69→
+    70→/* ── Utilidades de audio ────────────────────────────────────────────────── */
+    71→
+    72→/** Envuelve PCM16 LE mono en un WAV estándar RIFF. */
+    73→function pcmToWav(pcm: Buffer, sampleRate: number): Buffer {
+    74→  const header = Buffer.alloc(44)
+    75→  const bitsPerSample = 16
+    76→  const channels = 1
+    77→  const blockAlign = (channels * bitsPerSample) / 8
+    78→  header.write('RIFF', 0, 'ascii')
+    79→  header.writeUInt32LE(36 + pcm.length, 4)
+    80→  header.write('WAVE', 8, 'ascii')
+    81→  header.write('fmt ', 12, 'ascii')
+    82→  header.writeUInt32LE(16, 16)
+    83→  header.writeUInt16LE(1, 20)
+    84→  header.writeUInt16LE(channels, 22)
+    85→  header.writeUInt32LE(sampleRate, 24)
+    86→  header.writeUInt32LE(sampleRate * blockAlign, 28)
+    87→  header.writeUInt16LE(blockAlign, 32)
+    88→  header.writeUInt16LE(bitsPerSample, 34)
+    89→  header.write('data', 36, 'ascii')
+    90→  header.writeUInt32LE(pcm.length, 40)
+    91→  return Buffer.concat([header, pcm])
+    92→}
+    93→
+    94→/** Reduce markdown a texto hablable (igual que la ruta /api/tools/tts). */
+    95→function toSpeakable(input: string): string {
+    96→  return input
+    97→    .replace(/```[\s\S]*?```/g, ' (bloque de código omitido) ')
+    98→    .replace(/`([^`]+)`/g, '$1')
+    99→    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+   100→    .replace(/^#{1,6}\s+/gm, '')
+   101→    .replace(/[*_~|>]+/g, ' ')
+   102→    .replace(/\s+/g, ' ')
+   103→    .trim()
+   104→}
+   105→
+   106→/* ── TTS: ElevenLabs en streaming (principal) con respaldo del núcleo ───── */
+   107→
+   108→type TtsChunk = { mime: string; b64: string }
+   109→
+   110→function sleep(ms: number): Promise<void> {
+   111→  return new Promise((resolve) => setTimeout(resolve, ms))
+   112→}
+   113→
+   114→/** Reintentos con retroceso para errores transitorios (429/5xx/red). */
+   115→async function withRetry<T>(fn: () => Promise<T>, attempts = 3, baseDelayMs = 700): Promise<T> {
+   116→  let lastErr: unknown
+   117→  for (let attempt = 1; attempt <= attempts; attempt++) {
+   118→    try {
+   119→      return await fn()
+   120→    } catch (err) {
+   121→      lastErr = err
+   122→      const msg = err instanceof Error ? err.message : String(err)
+   123→      const transient = /\b429\b|\b500\b|\b502\b|\b503\b|\b504\b|too many|rate|temporar|network|fetch failed|econn|socket/i.test(msg)
+   124→      if (attempt === attempts || !transient) throw err
+   125→      await sleep(baseDelayMs * attempt + Math.random() * 250)
+   126→    }
+   127→  }
+   128→  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
+   129→}
+   130→
+   131→/**
+   132→ * Claves de ElevenLabs con rotación: si la primaria se queda sin créditos
+   133→ * (401) o recibe límite (429), se enfría 60 s y la siguiente toma el turno.
+   134→ * Con todas agotadas, la voz del núcleo respalda cada frase.
+   135→ */
+   136→type ElevenKey = { key: string; cooldownUntil: number }
+   137→let elevenKeysCache: ElevenKey[] | null = null
+   138→function getElevenKeys(): ElevenKey[] {
+   139→  if (!elevenKeysCache) {
+   140→    elevenKeysCache = [process.env.ELEVENLABS_API_KEY, process.env.ELEVENLABS_API_KEY_FALLBACK]
+   141→      .map((k) => k?.trim())
+   142→      .filter((k): k is string => Boolean(k))
+   143→      .map((key) => ({ key, cooldownUntil: 0 }))
+   144→    if (elevenKeysCache.length > 0) {
+   145→      console.log(`[voice] ElevenLabs: ${elevenKeysCache.length} clave(s) activa(s) (…${elevenKeysCache.map((k) => k.key.slice(-4)).join(', …')})`)
+   146→    }
+   147→  }
+   148→  return elevenKeysCache
+   149→}
+   150→
+   151→async function synthesizeSentence(
+   152→  text: string,
+   153→  signal: AbortSignal,
+   154→  onChunk: (c: TtsChunk) => void,
+   155→): Promise<{ provider: string; mime: string }> {
+   156→  for (const ks of getElevenKeys()) {
+   157→    if (Date.now() < ks.cooldownUntil) continue
+   158→    const voiceId = process.env.ELEVENLABS_VOICE_ID?.trim() || '21m00Tcm4TlvDq8ikWAM'
+   159→    const modelId = process.env.ELEVENLABS_MODEL_ID?.trim() || 'eleven_multilingual_v2'
+   160→    try {
+   161→      const res = await fetch(
+   162→        `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
+   163→        {
+   164→          method: 'POST',
+   165→          headers: { 'xi-api-key': ks.key, 'Content-Type': 'application/json' },
+   166→          body: JSON.stringify({
+   167→            text,
+   168→            model_id: modelId,
+   169→            voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.0, use_speaker_boost: true },
+   170→          }),
+   171→          signal,
+   172→          cache: 'no-store',
+   173→        },
+   174→      )
+   175→      if (!res.ok) {
+   176→        // 401/403 sin créditos o credenciales; 429 límite: enfría la clave y
+   177→        // rota a la siguiente (no reintenta contra un fallo garantizado).
+   178→        if (res.status === 401 || res.status === 403 || res.status === 429) {
+   179→          ks.cooldownUntil = Date.now() + 60_000
+   180→          console.log(`[voice] clave ElevenLabs …${ks.key.slice(-4)} sin créditos o limitada; roto de clave`)
+   181→          continue
+   182→        }
+   183→        throw new Error(`ElevenLabs HTTP ${res.status}`)
+   184→      }
+   185→      if (!res.body) throw new Error('ElevenLabs sin cuerpo de streaming')
+   186→      const reader = res.body.getReader()
+   187→      let bytes = 0
+   188→      for (;;) {
+   189→        const { done, value } = await reader.read()
+   190→        if (done) break
+   191→        if (value && value.length > 0) {
+   192→          bytes += value.length
+   193→          onChunk({ mime: 'audio/mpeg', b64: Buffer.from(value).toString('base64') })
+   194→        }
+   195→      }
+   196→      if (bytes < 512) throw new Error('ElevenLabs devolvió audio vacío')
+   197→      return { provider: 'elevenlabs', mime: 'audio/mpeg' }
+   198→    } catch (err) {
+   199→      if (signal.aborted) throw err
+   200→      console.log('[voice] ElevenLabs falló para la frase; respaldo z-ai:', err instanceof Error ? err.message : err)
+   201→      break
+   202→    }
+   203→  }
+   204→
+   205→  // Respaldo: voz del núcleo z-ai (WAV completo, un solo chunk).
+   206→  const zai = await getZai()
+   207→  const response = await withRetry(() =>
+   208→    zai.audio.tts.create({
+   209→      input: text.slice(0, 900),
+   210→      voice: 'tongtong',
+   211→      speed: 1.0,
+   212→      response_format: 'wav',
+   213→      stream: false,
+   214→    }),
+   215→  )
+   216→  const buffer = Buffer.from(new Uint8Array(await response.arrayBuffer()))
+   217→  if (buffer.byteLength < 512) throw new Error('El proveedor de voz devolvió audio vacío')
+   218→  onChunk({ mime: 'audio/wav', b64: buffer.toString('base64') })
+   219→  return { provider: 'zai-org', mime: 'audio/wav' }
+   220→}
+   221→
+   222→/* ── Estado por conexión ────────────────────────────────────────────────── */
+   223→
+   224→const VAD = {
+   225→  speechStartFactor: 2.2,
+   226→  absoluteFloor: 0.012,
+   227→  startChunks: 2,
+   228→  // El usuario pidió explícitamente: 2 segundos seguidos de silencio cierran
+   229→  // la frase y disparan la respuesta (evita cortes con pausas al pensar).
+   230→  hangoverMs: 2_000,
+   231→  minSpeechMs: 350,
+   232→  maxUtteranceMs: 20_000,
+   233→  bargeInChunks: 5, // habla alta sostenida durante la respuesta → interrumpe
+   234→  bargeInFactor: 2.6,
+   235→}
+   236→
+   237→type VoiceSession = {
+   238→  sampleRate: number
+   239→  sessionId: string | null
+   240→  cookie: string | null
+   241→  token: string | null
+   242→  muted: boolean
+   243→  ttsSid: number
+   244→  // VAD
+   245→  noiseFloor: number
+   246→  loudStreak: number
+   247→  utterance: { parts: Buffer[]; bytes: number; startedAt: number; speechMs: number; endedAt: number | null; loud: number } | null
+   248→  // Turno en curso
+   249→  turnId: number
+   250→  turnBusy: boolean
+   251→  turnController: AbortController | null
+   252→  ttsQueue: string[]
+   253→  ttsBusy: boolean
+   254→  watchdog: ReturnType<typeof setTimeout> | null
+   255→}
+   256→
+   257→function newSession(): VoiceSession {
+   258→  return {
+   259→    sampleRate: 16_000,
+   260→    sessionId: null,
+   261→    cookie: null,
+   262→    token: null,
+   263→    muted: false,
+   264→    ttsSid: 0,
+   265→    noiseFloor: 0.02,
+   266→    loudStreak: 0,
+   267→    utterance: null,
+   268→    turnId: 0,
+   269→    turnBusy: false,
+   270→    turnController: null,
+   271→    ttsQueue: [],
+   272→    ttsBusy: false,
+   273→    watchdog: null,
+   274→  }
+   275→}
+   276→
+   277→/** Divisor de frases para TTS: suelta cada oración apenas está completa. */
+   278→class SentenceChunker {
+   279→  private buf = ''
+   280→  /** Devuelve las frases listas tras añadir texto. */
+   281→  push(delta: string): string[] {
+   282→    this.buf += delta
+   283→    const out: string[] = []
+   284→    for (;;) {
+   285→      // Fin de oración fuerte, o coma si el buffer ya es largo.
+   286→      const strong = this.buf.match(/[\s\S]*?[.!?…\n](\s|$)/)
+   287→      let cut = strong ? strong[0].length : 0
+   288→      if (!cut && this.buf.length > 220) {
+   289→        const comma = this.buf.indexOf(',')
+   290→        if (comma > 0) cut = comma + 1
+   291→      }
+   292→      if (!cut && this.buf.length > 480) cut = this.buf.length
+   293→      if (!cut) break
+   294→      const sentence = this.buf.slice(0, cut).trim()
+   295→      this.buf = this.buf.slice(cut)
+   296→      if (sentence) out.push(sentence)
+   297→    }
+   298→    return out
+   299→  }
+   300→  flush(): string[] {
+   301→    const rest = this.buf.trim()
+   302→    this.buf = ''
+   303→    return rest ? [rest] : []
+   304→  }
+   305→}
+   306→
+   307→/* ── Servidor ───────────────────────────────────────────────────────────── */
+   308→
+   309→const httpServer = createServer()
+   310→const io = new Server(httpServer, {
+   311→  // DO NOT change the path: Caddy lo usa para reenviar al puerto correcto.
+   312→  path: '/',
+   313→  cors: { origin: '*', methods: ['GET', 'POST'] },
+   314→  pingTimeout: 60_000,
+   315→  pingInterval: 25_000,
+   316→  maxHttpBufferSize: 2e6,
+   317→})
+   318→
+   319→function emit(socket: Socket, event: string, data: unknown) {
+   320→  socket.emit(event, data)
+   321→}
+   322→
+   323→/**
+   324→ * Turno completo con el texto YA transcrito: OE AI LLM (SSE) ➡️ frases ➡️
+   325→ * TTS ElevenLabs en streaming. Lo invocan tanto la ruta de audio (ASR del
+   326→ * núcleo) como el evento voice:text (Web Speech API del navegador).
+   327→ */
+   328→async function runTurn(socket: Socket, session: VoiceSession, transcript: string, existing?: AbortController) {
+   329→  if (session.turnBusy) return
+   330→  const turnId = ++session.turnId
+   331→  session.turnBusy = true
+   332→  const controller = existing ?? new AbortController()
+   333→  session.turnController = controller
+   334→  const startedAt = Date.now()
+   335→
+   336→  session.watchdog = setTimeout(() => controller.abort(), 60_000)
+   337→
+   338→  try {
+   339→    emit(socket, 'voice:user-transcript', { turnId, text: transcript })
+   340→    console.log(`[voice] #${turnId} usuario: ${transcript.slice(0, 120)}`)
+   341→
+   342→    // OE AI LLM (misma cuota y sesión que el chat escrito) vía SSE.
+   343→    emit(socket, 'voice:status', { turnId, phase: 'thinking' })
+   344→    const chunker = new SentenceChunker()
+   345→    let fullText = ''
+   346→    const headers: Record<string, string> = {
+   347→      'Content-Type': 'application/json',
+   348→      Accept: 'text/event-stream',
+   349→    }
+   350→    if (session.cookie) headers.Cookie = session.cookie
+   351→    if (session.token) headers.Authorization = `Bearer ${session.token}`
+   352→
+   353→    const res = await fetch(CHAT_URL, {
+   354→      method: 'POST',
+   355→      headers,
+   356→      // voice: true → el núcleo responde SIEMPRE en español, breve y sin
+   357→      // markdown: el texto se convierte en voz con ElevenLabs.
+   358→      body: JSON.stringify({
+   359→        sessionId: session.sessionId ?? crypto.randomUUID(),
+   360→        message: transcript.slice(0, 4000),
+   361→        mode: 'instant',
+   362→        webSearch: false,
+   363→        voice: true,
+   364→      }),
+   365→      signal: controller.signal,
+   366→    })
+   367→
+   368→    // Cookies del navegador/cuota: conserva el huésped para los próximos turnos.
+   369→    const setCookie = res.headers.get('set-cookie')
+   370→    if (setCookie) {
+   371→      const m = setCookie.match(/oe_guest=[^;]+/)
+   372→      if (m) session.cookie = m[0]
+   373→    }
+   374→
+   375→    if (!res.ok) {
+   376→      const data = (await res.json().catch(() => null)) as { error?: string; errorType?: string } | null
+   377→      const message =
+   378→        data?.errorType === 'guest_limit_reached'
+   379→          ? 'Se agotaron tus 5 chats gratis de esta sesión. Inicia sesión con Google para continuar.'
+   380→          : (data?.error ?? `El chat no pudo empezar (HTTP ${res.status}).`)
+   381→      emit(socket, 'voice:error', { turnId, message, errorType: data?.errorType ?? null, status: res.status })
+   382→      return
+   383→    }
+   384→    if (!res.body) throw new Error('La respuesta del chat no trae flujo SSE')
+   385→
+   386→    // 3) Relay de deltas + cola de frases para TTS en streaming.
+   387→    const reader = res.body.getReader()
+   388→    const decoder = new TextDecoder()
+   389→    let sseBuf = ''
+   390→    // CRÍTICO: cada frase encolada debe despertar la bomba TTS inmediatamente.
+   391→    // Antes la bomba solo se lanzaba al inicio del turno (con la cola vacía) y
+   392→    // las frases se acumulaban sin sonar: el asistente respondía en silencio.
+   393→    const speak = (sentence: string) => {
+   394→      const clean = toSpeakable(sentence)
+   395→      if (clean) {
+   396→        session.ttsQueue.push(clean)
+   397→        void pumpTts(socket, session)
+   398→      }
+   399→    }
+   400→    const drainSpeak = () => {
+   401→      for (const s of chunker.flush()) speak(s)
+   402→    }
+   403→
+   404→    for (;;) {
+   405→      const { done, value } = await reader.read()
+   406→      if (done) break
+   407→      if (controller.signal.aborted) break
+   408→      sseBuf += decoder.decode(value, { stream: true })
+   409→      let idx: number
+   410→      while ((idx = sseBuf.indexOf('\n\n')) >= 0) {
+   411→        const rawEvent = sseBuf.slice(0, idx)
+   412→        sseBuf = sseBuf.slice(idx + 2)
+   413→        let event = 'message'
+   414→        let data = ''
+   415→        for (const line of rawEvent.split('\n')) {
+   416→          if (line.startsWith('event:')) event = line.slice(6).trim()
+   417→          else if (line.startsWith('data:')) data += line.slice(5).trim()
+   418→        }
+   419→        if (!data) continue
+   420→        let payload: Record<string, unknown>
+   421→        try {
+   422→          payload = JSON.parse(data) as Record<string, unknown>
+   423→        } catch {
+   424→          continue
+   425→        }
+   426→        if (event === 'delta' && typeof payload.text === 'string') {
+   427→          fullText += payload.text
+   428→          emit(socket, 'voice:assistant-delta', { turnId, text: payload.text })
+   429→          for (const s of chunker.push(payload.text)) speak(s)
+   430→        } else if (event === 'done') {
+   431→          drainSpeak()
+   432→        } else if (event === 'error') {
+   433→          throw new Error(String(payload.message ?? 'El núcleo no pudo responder.'))
+   434→        }
+   435→      }
+   436→    }
+   437→    if (!controller.signal.aborted) drainSpeak()
+   438→
+   439→    if (!fullText.trim()) {
+   440→      emit(socket, 'voice:error', { turnId, message: 'OE AI LLM no devolvió respuesta. Inténtalo otra vez.', status: 502 })
+   441→      return
+   442→    }
+   443→    emit(socket, 'voice:assistant-done', { turnId, text: fullText })
+   444→    console.log(`[voice] #${turnId} respuesta (${((Date.now() - startedAt) / 1000).toFixed(1)}s): ${fullText.slice(0, 100)}`)
+   445→  } catch (err) {
+   446→    if (!controller.signal.aborted) {
+   447→      emit(socket, 'voice:error', {
+   448→        turnId,
+   449→        message: err instanceof Error ? err.message : 'Fallo inesperado en el turno de voz.',
+   450→      })
+   451→    }
+   452→  } finally {
+   453→    if (session.watchdog) clearTimeout(session.watchdog)
+   454→    session.watchdog = null
+   455→    if (session.turnController === controller) {
+   456→      session.turnController = null
+   457→      session.turnBusy = false
+   458→    }
+   459→  }
+   460→}
+   461→
+   462→/**
+   463→ * Ruta de AUDIO (respaldo): ASR del núcleo ➡️ runTurn. Se usa cuando el
+   464→ * navegador no ofrece Web Speech API o su servicio de reconocimiento falla.
+   465→ */
+   466→async function handleUtterance(socket: Socket, session: VoiceSession, pcm: Buffer) {
+   467→  if (session.turnBusy) return
+   468→  session.turnBusy = true
+   469→  const controller = new AbortController()
+   470→  session.turnController = controller
+   471→  const asrTurnId = session.turnId + 1
+   472→  const asrWatchdog = setTimeout(() => controller.abort(), 30_000)
+   473→
+   474→  try {
+   475→    // ASR del núcleo: audio → texto (con reintentos si el proveedor
+   476→    // responde 429 por ráfaga).
+   477→    emit(socket, 'voice:status', { turnId: asrTurnId, phase: 'transcribing' })
+   478→    const wav = pcmToWav(pcm, session.sampleRate)
+   479→    const zai = await getZai()
+   480→    const asr = await withRetry(() => zai.audio.asr.create({ file_base64: wav.toString('base64') }))
+   481→    const transcript = (asr.text ?? '').trim()
+   482→    if (controller.signal.aborted) return
+   483→    if (!transcript) {
+   484→      emit(socket, 'voice:notice', { turnId: asrTurnId, message: 'No te escuché bien. Acércate al micrófono e inténtalo de nuevo.' })
+   485→      return
+   486→    }
+   487→    // El testigo (controller y busy) pasa al turno completo sin pausas.
+   488→    session.turnBusy = false
+   489→    await runTurn(socket, session, transcript, controller)
+   490→  } catch (err) {
+   491→    if (!controller.signal.aborted) {
+   492→      emit(socket, 'voice:error', {
+   493→        turnId: asrTurnId,
+   494→        message: err instanceof Error ? err.message : 'No se pudo transcribir tu voz.',
+   495→      })
+   496→    }
+   497→  } finally {
+   498→    clearTimeout(asrWatchdog)
+   499→    if (session.turnController === controller) {
+   500→      session.turnController = null
+   501→      session.turnBusy = false
+   502→    }
+   503→  }
+   504→}
+   505→
+   506→/** Cola de TTS: sintetiza frases en orden mientras el cliente reproduce. */
+   507→async function pumpTts(socket: Socket, session: VoiceSession) {
+   508→  if (session.ttsBusy) return
+   509→  session.ttsBusy = true
+   510→  try {
+   511→    // sid MONOTÓNICO POR SESIÓN: si la bomba se relanza (cola vacía entre
+   512→    // frases), un contador local reiniciaría en 1 y el cliente mezclaría
+   513→    // chunks de frases distintas bajo el mismo sid (audio corrupto).
+   514→    while (session.ttsQueue.length > 0) {
+   515→      const sentence = session.ttsQueue.shift() as string
+   516→      const myController = session.turnController
+   517→      if (!myController || myController.signal.aborted) break
+   518→      const thisSid = ++session.ttsSid
+   519→      const turnId = session.turnId
+   520→      try {
+   521→        const { provider, mime } = await synthesizeSentence(
+   522→          sentence,
+   523→          myController.signal,
+   524→          (chunk) => {
+   525→            emit(socket, 'voice:tts-chunk', { turnId, sid: thisSid, mime: chunk.mime, b64: chunk.b64 })
+   526→          },
+   527→        )
+   528→        emit(socket, 'voice:tts-sentence', { turnId, sid: thisSid, mime, provider, done: true })
+   529→        console.log(`[voice] TTS frase ${thisSid} (${provider}, ${sentence.length} chars)`)
+   530→      } catch (err) {
+   531→        if (myController.signal.aborted) break
+   532→        emit(socket, 'voice:notice', { turnId, message: 'Una frase no pudo sonar; sigo con el resto.' })
+   533→        console.log('[voice] error TTS de frase:', err instanceof Error ? err.message : err)
+   534→      }
+   535→    }
+   536→  } finally {
+   537→    session.ttsBusy = false
+   538→  }
+   539→}
+   540→
+   541→io.on('connection', (socket) => {
+   542→  const session = newSession()
+   543→  session.cookie = socket.handshake.headers.cookie ?? null
+   544→  const auth = (socket.handshake.auth ?? {}) as { token?: string; sessionId?: string }
+   545→  session.token = typeof auth.token === 'string' && auth.token.length > 10 ? auth.token : null
+   546→  session.sessionId =
+   547→    typeof auth.sessionId === 'string' && /^[0-9a-f-]{36}$/i.test(auth.sessionId) ? auth.sessionId : null
+   548→  console.log(`[voice] cliente conectado: ${socket.id} (cookie: ${Boolean(session.cookie)}, token: ${Boolean(session.token)})`)
+   549→
+   550→  socket.on('voice:start', (data: { sampleRate?: number } | undefined) => {
+   551→    const rate = Number(data?.sampleRate)
+   552→    if (Number.isFinite(rate) && rate >= 8_000 && rate <= 96_000) session.sampleRate = Math.round(rate)
+   553→    session.muted = false
+   554→    emit(socket, 'voice:status', { turnId: session.turnId, phase: 'listening' })
+   555→    console.log(`[voice] sesión de voz iniciada (${socket.id}, ${session.sampleRate} Hz)`)
+   556→  })
+   557→
+   558→  socket.on('voice:mute', (data: { muted?: boolean } | undefined) => {
+   559→    session.muted = Boolean(data?.muted)
+   560→    if (session.muted && session.utterance) session.utterance = null
+   561→  })
+   562→
+   563→  /**
+   564→   * Texto ya transcrito por el navegador (Web Speech API): salta el ASR del
+   565→   * servidor y entra directo al modelo — subtítulos en vivo y respuesta con
+   566→   * 2 s de silencio, sin coste de transcripción.
+   567→   */
+   568→  socket.on('voice:text', async (data: { text?: string } | undefined) => {
+   569→    const text = (typeof data?.text === 'string' ? data.text : '').trim().slice(0, 4000)
+   570→    if (!text || session.muted || session.turnBusy) return
+   571→    await runTurn(socket, session, text)
+   572→    if (!session.turnBusy) emit(socket, 'voice:status', { turnId: session.turnId, phase: 'listening' })
+   573→  })
+   574→
+   575→  socket.on('voice:audio', (data: { b64?: string; rms?: number } | undefined) => {
+   576→    if (session.muted || !data?.b64) return
+   577→    const rms = Number(data.rms)
+   578→    if (!Number.isFinite(rms)) return
+   579→    const now = Date.now()
+   580→    // Duración REAL del chunk (PCM16 mono): el cliente captura a la tasa
+   581→    // nativa del dispositivo y remuestrea a 16 kHz, así que los chunks no
+   582→    // miden exactamente 100 ms — medirlos mal sesga el VAD (cortes prematuros
+   583→    // o frases que nunca cierran).
+   584→    const pcmChunk = Buffer.from(data.b64, 'base64')
+   585→    if (pcmChunk.length === 0) return
+   586→    const chunkMs = Math.max(40, Math.round((pcmChunk.length / 2 / session.sampleRate) * 1000))
+   587→
+   588→    // Barge-in: habla alta sostenida mientras OE AI responde → interrumpe.
+   589→    if (session.turnBusy && rms > Math.max(VAD.absoluteFloor, session.noiseFloor) * VAD.bargeInFactor) {
+   590→      session.loudStreak += 1
+   591→      if (session.loudStreak >= VAD.bargeInChunks) {
+   592→        console.log('[voice] barge-in: el usuario interrumpe la respuesta')
+   593→        interrupt(socket, session)
+   594→        session.loudStreak = 0
+   595→        session.utterance = { parts: [], bytes: 0, startedAt: now, speechMs: 0, endedAt: null, loud: 0 }
+   596→      }
+   597→    } else {
+   598→      session.loudStreak = Math.max(0, session.loudStreak - 1)
+   599→    }
+   600→
+   601→    const threshold = Math.max(VAD.absoluteFloor, session.noiseFloor * VAD.speechStartFactor)
+   602→    const isSpeech = rms >= threshold
+   603→
+   604→    if (session.turnBusy && !session.utterance) return // no guarda audio durante la respuesta
+   605→
+   606→    if (!session.utterance) {
+   607→      // Escucha pasiva: adapta el piso de ruido con el silencio.
+   608→      if (!isSpeech) session.noiseFloor = Math.min(0.06, session.noiseFloor * 1.01 + rms * 0.002)
+   609→      if (isSpeech) {
+   610→        session.utterance = { parts: [], bytes: 0, startedAt: now, speechMs: chunkMs, endedAt: null, loud: 0 }
+   611→      }
+   612→      return
+   613→    }
+   614→
+   615→    // Dentro de una frase en construcción.
+   616→    const u = session.utterance
+   617→    u.parts.push(pcmChunk)
+   618→    u.bytes += pcmChunk.length
+   619→    if (isSpeech) {
+   620→      u.speechMs += chunkMs
+   621→      u.endedAt = null
+   622→    } else if (u.speechMs >= VAD.minSpeechMs) {
+   623→      u.endedAt = u.endedAt ?? now
+   624→    }
+   625→
+   626→    const silenceMs = u.endedAt ? now - u.endedAt : 0
+   627→    const elapsed = now - u.startedAt
+   628→    if ((u.endedAt && silenceMs >= VAD.hangoverMs) || elapsed >= VAD.maxUtteranceMs) {
+   629→      const pcm = Buffer.concat(u.parts)
+   630→      session.utterance = null
+   631→      if (u.speechMs >= VAD.minSpeechMs) {
+   632→        void handleUtterance(socket, session, pcm).then(() => {
+   633→          if (!session.turnBusy) emit(socket, 'voice:status', { turnId: session.turnId, phase: 'listening' })
+   634→        })
+   635→        void pumpTts(socket, session)
+   636→      }
+   637→    }
+   638→  })
+   639→
+   640→  /** El usuario corta su propia frase (botón "listo" opcional). */
+   641→  socket.on('voice:stop-speech', () => {
+   642→    const u = session.utterance
+   643→    if (u && u.speechMs >= VAD.minSpeechMs && !session.turnBusy) {
+   644→      const pcm = Buffer.concat(u.parts)
+   645→      session.utterance = null
+   646→      void handleUtterance(socket, session, pcm).then(() => {
+   647→        if (!session.turnBusy) emit(socket, 'voice:status', { turnId: session.turnId, phase: 'listening' })
+   648→      })
+   649→      void pumpTts(socket, session)
+   650→    }
+   651→  })
+   652→
+   653→  /** Interrupción manual (toque sobre el orbe o botón). */
+   654→  socket.on('voice:interrupt', () => {
+   655→    interrupt(socket, session)
+   656→  })
+   657→
+   658→  function interrupt(socket: Socket, session: VoiceSession) {
+   659→    session.ttsQueue = []
+   660→    session.utterance = null
+   661→    session.loudStreak = 0
+   662→    if (session.turnController) {
+   663→      session.turnController.abort()
+   664→      session.turnController = null
+   665→    }
+   666→    session.turnBusy = false
+   667→    emit(socket, 'voice:status', { turnId: session.turnId, phase: 'listening' })
+   668→  }
+   669→
+   670→  socket.on('voice:end', () => {
+   671→    interrupt(socket, session)
+   672→  })
+   673→
+   674→  socket.on('disconnect', () => {
+   675→    interrupt(socket, session)
+   676→    console.log(`[voice] cliente desconectado: ${socket.id}`)
+   677→  })
+   678→
+   679→  socket.on('error', (error) => {
+   680→    console.error(`[voice] error de socket (${socket.id}):`, error)
+   681→  })
+   682→})
+   683→
+   684→httpServer.listen(PORT, () => {
+   685→  console.log(`[voice] servicio de voz en tiempo real en el puerto ${PORT}`)
+   686→})
+   687→
+   688→process.on('SIGTERM', () => {
+   689→  httpServer.close(() => process.exit(0))
+   690→})
+   691→process.on('SIGINT', () => {
+   692→  httpServer.close(() => process.exit(0))
+   693→})
+   694→

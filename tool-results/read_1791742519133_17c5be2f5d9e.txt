@@ -1,0 +1,252 @@
+     1→/home/z/my-project/src/app/api/agent/projects/[id]/download/route.ts:7: * GET /api/agent/projects/[id]/download — descarga el proyecto real como .zip
+     2→/home/z/my-project/src/app/api/agent/projects/[id]/download/route.ts:17:    const project = await db.agentProject.findUnique({ where: { id }, select: { title: true } })
+     3→/home/z/my-project/src/app/api/agent/projects/[id]/download/route.ts:20:    const files = await db.agentFile.findMany({
+     4→/home/z/my-project/src/app/api/agent/projects/[id]/download/route.ts:29:    const root = zip.folder('oe-agent-app')
+     5→/home/z/my-project/src/app/api/agent/projects/[id]/download/route.ts:42:        .slice(0, 40) || 'oe-agent-app'
+     6→/home/z/my-project/src/app/api/agent/projects/[id]/download/route.ts:52:    console.error('[api/agent/projects/:id/download] error:', err instanceof Error ? err.message : err)
+     7→/home/z/my-project/src/app/api/agent/projects/[id]/deploy/route.ts:4:import { workspaceDir } from '@/lib/agent/runner'
+     8→/home/z/my-project/src/app/api/agent/projects/[id]/deploy/route.ts:10: * POST /api/agent/projects/[id]/deploy — despliegue REAL a Vercel.
+     9→/home/z/my-project/src/app/api/agent/projects/[id]/deploy/route.ts:26:    await db.agentProject.update({ where: { id }, data: { vercelState: 'needs_config' } }).catch(() => undefined)
+    10→/home/z/my-project/src/app/api/agent/projects/[id]/deploy/route.ts:38:  const project = await db.agentProject.findUnique({ where: { id }, select: { title: true } })
+    11→/home/z/my-project/src/app/api/agent/projects/[id]/deploy/route.ts:82:      .slice(0, 40) || 'oe-agent-app'
+    12→/home/z/my-project/src/app/api/agent/projects/[id]/deploy/route.ts:84:  await db.agentProject.update({ where: { id }, data: { vercelState: 'deploying', vercelUrl: null } })
+    13→/home/z/my-project/src/app/api/agent/projects/[id]/deploy/route.ts:105:      await db.agentProject.update({ where: { id }, data: { vercelState: 'error' } })
+    14→/home/z/my-project/src/app/api/agent/projects/[id]/deploy/route.ts:106:      console.error('[api/agent/deploy] vercel create error:', res.status, detail.slice(0, 300))
+    15→/home/z/my-project/src/app/api/agent/projects/[id]/deploy/route.ts:120:      await db.agentProject.update({ where: { id }, data: { vercelState: 'error' } })
+    16→/home/z/my-project/src/app/api/agent/projects/[id]/deploy/route.ts:143:      await db.agentProject.update({ where: { id }, data: { vercelState: 'deployed', vercelUrl: url } })
+    17→/home/z/my-project/src/app/api/agent/projects/[id]/deploy/route.ts:154:    await db.agentProject.update({ where: { id }, data: { vercelState: 'error' } })
+    18→/home/z/my-project/src/app/api/agent/projects/[id]/deploy/route.ts:165:    await db.agentProject.update({ where: { id }, data: { vercelState: 'error' } })
+    19→/home/z/my-project/src/app/api/agent/projects/[id]/deploy/route.ts:166:    console.error('[api/agent/deploy] error:', err instanceof Error ? err.message : err)
+    20→/home/z/my-project/src/app/api/agent/projects/[id]/preview/[[...path]]/route.ts:2:import { ensureDevServer, previewBasePath } from '@/lib/agent/runner'
+    21→/home/z/my-project/src/app/api/agent/projects/[id]/preview/[[...path]]/route.ts:8: * Proxy REAL de la vista previa: /api/agent/projects/[id]/preview/**
+    22→/home/z/my-project/src/app/api/agent/projects/[id]/preview/[[...path]]/route.ts:10: * Sirve el proyecto Next.js REAL generado por el agente (servidor `next dev`
+    23→/home/z/my-project/src/app/api/agent/projects/[id]/preview/[[...path]]/route.ts:71:  const project = await db.agentProject.findUnique({ where: { id }, select: { devPort: true, status: true } })
+    24→/home/z/my-project/src/app/api/agent/projects/[id]/preview/[[...path]]/route.ts:73:    return new Response(statusPage('Proyecto no encontrado', 'El identificador no corresponde a ningún proyecto del agente.', '#f87171'), { status: 404, headers: HTML_HEADERS })
+    25→/home/z/my-project/src/app/api/agent/projects/[id]/preview/[[...path]]/route.ts:76:  const filesCount = await db.agentFile.count({ where: { projectId: id } })
+    26→/home/z/my-project/src/app/api/agent/projects/[id]/preview/[[...path]]/route.ts:79:      statusPage('Preparando el proyecto', 'El agente todavía no ha escrito archivos en el workspace. Espera a que termine el turno en curso.', '#fbbf24'),
+    27→/home/z/my-project/src/app/agent/page.tsx:2:import { AgentApp } from '@/components/agent/agent-app'
+    28→/home/z/my-project/src/app/agent/page.tsx:5:  title: 'Modo Agente · OE AI',
+    29→/home/z/my-project/src/app/agent/page.tsx:7:    'Describe una aplicación y el Agente de OE AI la construye: plan, archivos Next.js reales, terminal y vista previa en vivo.',
+    30→/home/z/my-project/src/app/agent/page.tsx:10:export default function AgentPage() {
+    31→/home/z/my-project/src/app/agent/page.tsx:12:    <main aria-label="Modo Agente de OE AI">
+    32→/home/z/my-project/src/app/agent/page.tsx:13:      <AgentApp />
+    33→/home/z/my-project/src/app/api/agent/projects/[id]/route.ts:2:import { devServerStatus, destroyWorkspace } from '@/lib/agent/runner'
+    34→/home/z/my-project/src/app/api/agent/projects/[id]/route.ts:3:import type { AgentMode, AgentProjectState } from '@/lib/agent/types'
+    35→/home/z/my-project/src/app/api/agent/projects/[id]/route.ts:7:/** GET /api/agent/projects/[id] — estado completo (mensajes, archivos, terminal). */
+    36→/home/z/my-project/src/app/api/agent/projects/[id]/route.ts:14:    const project = await db.agentProject.findUnique({ where: { id } })
+    37→/home/z/my-project/src/app/api/agent/projects/[id]/route.ts:20:      db.agentMessage.findMany({ where: { projectId: id }, orderBy: { createdAt: 'asc' } }),
+    38→/home/z/my-project/src/app/api/agent/projects/[id]/route.ts:21:      db.agentFile.findMany({ where: { projectId: id }, orderBy: { path: 'asc' } }),
+    39→/home/z/my-project/src/app/api/agent/projects/[id]/route.ts:22:      db.agentLog.findMany({ where: { projectId: id }, orderBy: { seq: 'asc' } }),
+    40→/home/z/my-project/src/app/api/agent/projects/[id]/route.ts:25:    const state: AgentProjectState = {
+    41→/home/z/my-project/src/app/api/agent/projects/[id]/route.ts:30:        mode: project.mode as AgentMode,
+    42→/home/z/my-project/src/app/api/agent/projects/[id]/route.ts:68:    console.error('[api/agent/projects/:id] error:', err instanceof Error ? err.message : err)
+    43→/home/z/my-project/src/app/api/agent/projects/[id]/route.ts:73:/** DELETE /api/agent/projects/[id] — elimina el proyecto (cascada completa). */
+    44→/home/z/my-project/src/app/api/agent/projects/[id]/route.ts:80:    const existing = await db.agentProject.findUnique({ where: { id }, select: { id: true } })
+    45→/home/z/my-project/src/app/api/agent/projects/[id]/route.ts:84:    await db.agentProject.delete({ where: { id } })
+    46→/home/z/my-project/src/app/api/agent/projects/[id]/route.ts:87:    console.error('[api/agent/projects/:id] delete error:', err instanceof Error ? err.message : err)
+    47→/home/z/my-project/src/app/api/agent/projects/[id]/terminal/route.ts:5:import { runUserTerminalCommand } from '@/lib/agent/pipeline'
+    48→/home/z/my-project/src/app/api/agent/projects/[id]/terminal/route.ts:6:import { workspaceDir } from '@/lib/agent/runner'
+    49→/home/z/my-project/src/app/api/agent/projects/[id]/terminal/route.ts:20: * POST /api/agent/projects/[id]/terminal — terminal REAL del proyecto.
+    50→/home/z/my-project/src/app/api/agent/projects/[id]/terminal/route.ts:23: * y transmite stdout/stderr línea a línea por SSE. Se persiste en AgentLog.
+    51→/home/z/my-project/src/app/api/agent/projects/[id]/terminal/route.ts:33:  const rl = checkRateLimit(clientKeyFromHeaders(request.headers, 'agent-term'), 20, 60_000)
+    52→/home/z/my-project/src/app/api/agent/projects/[id]/terminal/route.ts:48:  const project = await db.agentProject.findUnique({ where: { id }, select: { id: true } })
+    53→/home/z/my-project/src/app/api/agent/projects/[id]/terminal/route.ts:59:      { error: 'El proyecto todavía no tiene workspace en disco. Ejecuta primero una construcción del agente.', requestId },
+    54→/home/z/my-project/src/app/api/agent/projects/[id]/messages/route.ts:4:import { AgentPipeline } from '@/lib/agent/pipeline'
+    55→/home/z/my-project/src/app/api/agent/projects/[id]/messages/route.ts:5:import { isAgentMode, type AgentMode } from '@/lib/agent/types'
+    56→/home/z/my-project/src/app/api/agent/projects/[id]/messages/route.ts:19: * POST /api/agent/projects/[id]/messages — turno de continuación del agente:
+    57→/home/z/my-project/src/app/api/agent/projects/[id]/messages/route.ts:30:  const rl = checkRateLimit(clientKeyFromHeaders(request.headers, 'agent-msg'), 8, 60_000)
+    58→/home/z/my-project/src/app/api/agent/projects/[id]/messages/route.ts:45:  const project = await db.agentProject.findUnique({ where: { id }, select: { id: true, mode: true } })
+    59→/home/z/my-project/src/app/api/agent/projects/[id]/messages/route.ts:49:  const mode = (isAgentMode(project.mode) ? project.mode : 'fullstack') as AgentMode
+    60→/home/z/my-project/src/app/api/agent/projects/[id]/messages/route.ts:51:  await db.agentProject.update({ where: { id }, data: { status: 'coding', errorType: null } })
+    61→/home/z/my-project/src/app/api/agent/projects/[id]/messages/route.ts:52:  await db.agentMessage.create({
+    62→/home/z/my-project/src/app/api/agent/projects/[id]/messages/route.ts:73:        const pipeline = new AgentPipeline(id, send, abortController.signal)
+    63→/home/z/my-project/src/app/api/agent/projects/route.ts:4:import { isAgentMode, type AgentMode } from '@/lib/agent/types'
+    64→/home/z/my-project/src/app/api/agent/projects/route.ts:5:import { AgentPipeline } from '@/lib/agent/pipeline'
+    65→/home/z/my-project/src/app/api/agent/projects/route.ts:13:  mode: z.string().refine(isAgentMode).default('fullstack'),
+    66→/home/z/my-project/src/app/api/agent/projects/route.ts:20:/** GET /api/agent/projects — lista de proyectos para el sidebar del modo agente. */
+    67→/home/z/my-project/src/app/api/agent/projects/route.ts:23:    const projects = await db.agentProject.findMany({
+    68→/home/z/my-project/src/app/api/agent/projects/route.ts:46:    console.error('[api/agent/projects] list error:', err instanceof Error ? err.message : err)
+    69→/home/z/my-project/src/app/api/agent/projects/route.ts:52: * POST /api/agent/projects — crea el proyecto y ejecuta el turno inicial del
+    70→/home/z/my-project/src/app/api/agent/projects/route.ts:53: * agente (plan → código → vista previa) emitendo eventos SSE en vivo.
+    71→/home/z/my-project/src/app/api/agent/projects/route.ts:59:  const rl = checkRateLimit(clientKeyFromHeaders(request.headers, 'agent-create'), 4, 60_000)
+    72→/home/z/my-project/src/app/api/agent/projects/route.ts:76:  const mode = body.mode as AgentMode
+    73→/home/z/my-project/src/app/api/agent/projects/route.ts:78:  const existing = await db.agentProject.findUnique({ where: { id: body.projectId }, select: { id: true } })
+    74→/home/z/my-project/src/app/api/agent/projects/route.ts:83:  const project = await db.agentProject.create({
+    75→/home/z/my-project/src/app/api/agent/projects/route.ts:86:  await db.agentMessage.create({
+    76→/home/z/my-project/src/app/api/agent/projects/route.ts:107:        const pipeline = new AgentPipeline(project.id, send, abortController.signal)
+    77→/home/z/my-project/src/lib/agent/base-files.ts:2: * Plantilla base del proyecto generado por el Agente OE AI.
+    78→/home/z/my-project/src/lib/agent/base-files.ts:13:import type { AgentGeneratedFile } from './types'
+    79→/home/z/my-project/src/lib/agent/base-files.ts:15:export const BASE_FILES: AgentGeneratedFile[] = [
+    80→/home/z/my-project/src/lib/agent/base-files.ts:20:        name: 'oe-agent-app',
+    81→/home/z/my-project/src/lib/agent/base-files.ts:127:/** Copias de seguridad si el agente no entregó layout/globals imprescindibles. */
+    82→/home/z/my-project/src/lib/agent/base-files.ts:128:export const FALLBACK_FILES: AgentGeneratedFile[] = [
+    83→/home/z/my-project/src/lib/agent/base-files.ts:136:  description: 'Aplicación generada por el Agente de OE AI (OE BUSINESS).',
+    84→/home/z/my-project/src/lib/agent/prompts.ts:2: * Prompts del Modo Agente de OE AI (en español, tono de producto OE BUSINESS).
+    85→/home/z/my-project/src/lib/agent/prompts.ts:5: * La vista previa ya NO se simula: el agente escribe un proyecto Next.js real
+    86→/home/z/my-project/src/lib/agent/prompts.ts:8:import type { AgentMode } from './types'
+    87→/home/z/my-project/src/lib/agent/prompts.ts:10:const MODE_GUIDANCE: Record<AgentMode, string> = {
+    88→/home/z/my-project/src/lib/agent/prompts.ts:23:    'Eres el Agente Planificador de OE AI (OE BUSINESS).',
+    89→/home/z/my-project/src/lib/agent/prompts.ts:45:export function plannerUserPrompt(prompt: string, mode: AgentMode): string {
+    90→/home/z/my-project/src/lib/agent/prompts.ts:51:    'Eres el Agente de Código de OE AI (OE BUSINESS).',
+    91→/home/z/my-project/src/lib/agent/prompts.ts:68:export function coderUserPrompt(planJson: string, mode: AgentMode): string {
+    92→/home/z/my-project/src/lib/agent/prompts.ts:79:    'Eres el Agente de Código de OE AI (OE BUSINESS).',
+    93→/home/z/my-project/src/lib/agent/prompts.ts:96:  mode: AgentMode
+    94→/home/z/my-project/src/lib/agent/prompts.ts:108: * Prompt del Agente Reparador: recibe el error REAL del servidor/página y
+    95→/home/z/my-project/src/lib/agent/prompts.ts:113:    'Eres el Agente Reparador de OE AI (OE BUSINESS).',
+    96→/home/z/my-project/src/lib/agent/prompts.ts:166:        ? `_El agente reparó ${input.fixAttempts} ${input.fixAttempts === 1 ? 'error' : 'errores'} reales antes de verificar la página._`
+    97→/home/z/my-project/src/lib/agent/prompts.ts:181:      ? `- El agente reparó ${input.fixAttempts} ${input.fixAttempts === 1 ? 'error' : 'errores'} real${input.fixAttempts === 1 ? '' : 'es'} durante la verificación.`
+    98→/home/z/my-project/src/lib/agent/prompts.ts:186:    'Sigue pidiendo cambios: el agente los aplica sobre el proyecto en caliente. También puedes abrir el **Terminal** y ejecutar comandos reales, o publicar el proyecto en **Vercel**.',
+    99→/home/z/my-project/src/lib/agent/llm.ts:2: * Cliente LLM del Modo Agente (servidor únicamente).
+   100→/home/z/my-project/src/lib/agent/llm.ts:6: * colgó en producción y se retiró del agente).
+   101→/home/z/my-project/src/lib/agent/llm.ts:16:export class AgentLlmError extends Error {
+   102→/home/z/my-project/src/lib/agent/llm.ts:19:  constructor(message: string, errorType: AgentLlmError['errorType']) {
+   103→/home/z/my-project/src/lib/agent/llm.ts:27:const OPENROUTER_AGENT_MODEL = 'openai/gpt-oss-20b'
+   104→/home/z/my-project/src/lib/agent/llm.ts:30:export type AgentCore = 'openrouter/gpt-oss-20b' | 'zai-org:default'
+   105→/home/z/my-project/src/lib/agent/llm.ts:34:  core: AgentCore
+   106→/home/z/my-project/src/lib/agent/llm.ts:40:  if (!key) throw new AgentLlmError('OPENROUTER_API_KEY no configurada.', 'provider_error')
+   107→/home/z/my-project/src/lib/agent/llm.ts:47:      'X-Title': 'OE AI Agent',
+   108→/home/z/my-project/src/lib/agent/llm.ts:50:      model: OPENROUTER_AGENT_MODEL,
+   109→/home/z/my-project/src/lib/agent/llm.ts:55:  if (res.status === 429) throw new AgentLlmError('429', 'rate_limited')
+   110→/home/z/my-project/src/lib/agent/llm.ts:58:    throw new AgentLlmError(`OpenRouter HTTP ${res.status}: ${detail.slice(0, 160)}`, 'provider_error')
+   111→/home/z/my-project/src/lib/agent/llm.ts:62:  if (!content.trim()) throw new AgentLlmError('Respuesta vacía de OpenRouter.', 'empty_response')
+   112→/home/z/my-project/src/lib/agent/llm.ts:76:  if (!content.trim()) throw new AgentLlmError('El núcleo devolvió una respuesta vacía.', 'empty_response')
+   113→/home/z/my-project/src/lib/agent/llm.ts:86:export async function agentChatWithCore(
+   114→/home/z/my-project/src/lib/agent/llm.ts:95:      if (signal?.aborted) throw new AgentLlmError('Ejecución cancelada.', 'aborted')
+   115→/home/z/my-project/src/lib/agent/llm.ts:100:        if (signal?.aborted) throw new AgentLlmError('Ejecución cancelada.', 'aborted')
+   116→/home/z/my-project/src/lib/agent/llm.ts:114:    if (signal?.aborted) throw new AgentLlmError('Ejecución cancelada.', 'aborted')
+   117→/home/z/my-project/src/lib/agent/llm.ts:119:      if (signal?.aborted) throw new AgentLlmError('Ejecución cancelada.', 'aborted')
+   118→/home/z/my-project/src/lib/agent/llm.ts:120:      if (err instanceof AgentLlmError && err.errorType === 'aborted') throw err
+   119→/home/z/my-project/src/lib/agent/llm.ts:134:    throw new AgentLlmError(
+   120→/home/z/my-project/src/lib/agent/llm.ts:139:  throw new AgentLlmError(
+   121→/home/z/my-project/src/lib/agent/llm.ts:140:    'El agente no pudo completar el paso con ningún núcleo configurado. No se generó nada simulado.',
+   122→/home/z/my-project/src/lib/agent/llm.ts:146:export async function agentChat(messages: ChatRequestMessage[], signal?: AbortSignal): Promise<string> {
+   123→/home/z/my-project/src/lib/agent/llm.ts:147:  const { content } = await agentChatWithCore(messages, signal)
+   124→/home/z/my-project/src/lib/agent/llm.ts:159:  if (start === -1) throw new AgentLlmError('La respuesta no contiene JSON.', 'json_parse')
+   125→/home/z/my-project/src/lib/agent/llm.ts:182:          throw new AgentLlmError('El JSON del agente no pudo parsearse.', 'json_parse')
+   126→/home/z/my-project/src/lib/agent/llm.ts:187:  throw new AgentLlmError('El JSON del agente está incompleto.', 'json_parse')
+   127→/home/z/my-project/src/lib/agent/llm.ts:191:export async function agentChatJson<T>(
+   128→/home/z/my-project/src/lib/agent/llm.ts:195:): Promise<{ data: T; core: AgentCore }> {
+   129→/home/z/my-project/src/lib/agent/llm.ts:202:    const { content: raw, core } = await agentChatWithCore(messages, signal)
+   130→/home/z/my-project/src/lib/agent/llm.ts:215:      throw new AgentLlmError(
+   131→/home/z/my-project/src/lib/agent/llm.ts:216:        'El agente no produjo JSON válido tras reintentarlo.',
+   132→/home/z/my-project/src/lib/agent/llm.ts:222:  throw new AgentLlmError('Error interno del agente.', 'provider_error')
+   133→/home/z/my-project/src/lib/agent/pipeline.ts:2: * Pipeline del Modo Agente de OE AI — TODO REAL, nada simulado.
+   134→/home/z/my-project/src/lib/agent/pipeline.ts:5: *   1. Plan (agente planificador → JSON) → se convierte en la lista de Todos
+   135→/home/z/my-project/src/lib/agent/pipeline.ts:6: *   2. Código (agente de código → archivos completos) → escritura REAL en disco
+   136→/home/z/my-project/src/lib/agent/pipeline.ts:10: *      Agente Reparador si el servidor devuelve un error real
+   137→/home/z/my-project/src/lib/agent/pipeline.ts:14: * y persiste el terminal real en AgentLog. Nada se simula: si un paso falla,
+   138→/home/z/my-project/src/lib/agent/pipeline.ts:20:import { AgentLlmError, agentChatJson, type AgentCore } from './llm'
+   139→/home/z/my-project/src/lib/agent/pipeline.ts:44:  type AgentGeneratedFile,
+   140→/home/z/my-project/src/lib/agent/pipeline.ts:45:  type AgentMode,
+   141→/home/z/my-project/src/lib/agent/pipeline.ts:46:  type AgentPhase,
+   142→/home/z/my-project/src/lib/agent/pipeline.ts:47:  type AgentPlan,
+   143→/home/z/my-project/src/lib/agent/pipeline.ts:48:  type AgentTodo,
+   144→/home/z/my-project/src/lib/agent/pipeline.ts:64:/** Normaliza y valida la lista de archivos del agente de código. */
+   145→/home/z/my-project/src/lib/agent/pipeline.ts:65:function sanitizeFiles(raw: unknown, maxFiles: number): AgentGeneratedFile[] {
+   146→/home/z/my-project/src/lib/agent/pipeline.ts:68:  const out: AgentGeneratedFile[] = []
+   147→/home/z/my-project/src/lib/agent/pipeline.ts:82:function asPlan(raw: Record<string, unknown>): AgentPlan {
+   148→/home/z/my-project/src/lib/agent/pipeline.ts:129:  todos: AgentTodo[]
+   149→/home/z/my-project/src/lib/agent/pipeline.ts:134:export class AgentPipeline {
+   150→/home/z/my-project/src/lib/agent/pipeline.ts:135:  private todos: AgentTodo[] = []
+   151→/home/z/my-project/src/lib/agent/pipeline.ts:146:    const max = await db.agentLog.aggregate({ _max: { seq: true }, where: { projectId: this.projectId } })
+   152→/home/z/my-project/src/lib/agent/pipeline.ts:148:    await db.agentLog.create({ data: { projectId: this.projectId, seq, level, text: text.slice(0, 2000) } })
+   153→/home/z/my-project/src/lib/agent/pipeline.ts:157:  private setTodos(todos: AgentTodo[]) {
+   154→/home/z/my-project/src/lib/agent/pipeline.ts:162:  private setTodo(id: string, status: AgentTodo['status']) {
+   155→/home/z/my-project/src/lib/agent/pipeline.ts:167:  private async setPhase(phase: AgentPhase, note?: string) {
+   156→/home/z/my-project/src/lib/agent/pipeline.ts:169:    await db.agentProject.update({ where: { id: this.projectId }, data: { status, errorType: null } })
+   157→/home/z/my-project/src/lib/agent/pipeline.ts:208:    const existing = await db.agentFile.findUnique({
+   158→/home/z/my-project/src/lib/agent/pipeline.ts:213:    await db.agentFile.upsert({
+   159→/home/z/my-project/src/lib/agent/pipeline.ts:263:  /** Ejecuta un turno completo del agente (inicial o de continuación). */
+   160→/home/z/my-project/src/lib/agent/pipeline.ts:264:  async runTurn(opts: { isInitial: boolean; mode: AgentMode; userMessage: string }) {
+   161→/home/z/my-project/src/lib/agent/pipeline.ts:270:        ? `iniciar agente (${mode}) · pipeline real: plan → código → bun install → next dev → verificar`
+   162→/home/z/my-project/src/lib/agent/pipeline.ts:271:        : 'iniciar agente (iteración real) sobre el proyecto en disco')
+   163→/home/z/my-project/src/lib/agent/pipeline.ts:289:        await this.log('info', 'agente planificador analizando la petición')
+   164→/home/z/my-project/src/lib/agent/pipeline.ts:290:        const planner = await agentChatJson<Record<string, unknown>>(
+   165→/home/z/my-project/src/lib/agent/pipeline.ts:298:        await db.agentProject.update({
+   166→/home/z/my-project/src/lib/agent/pipeline.ts:319:      let filesChanged: AgentGeneratedFile[] = []
+   167→/home/z/my-project/src/lib/agent/pipeline.ts:322:      if (!plan) throw new AgentLlmError('El agente no disponía de plan válido.', 'json_parse')
+   168→/home/z/my-project/src/lib/agent/pipeline.ts:326:        await this.log('info', 'agente de código implementando los archivos del plan')
+   169→/home/z/my-project/src/lib/agent/pipeline.ts:327:        const coder = await agentChatJson<{ files?: unknown }>(
+   170→/home/z/my-project/src/lib/agent/pipeline.ts:336:          throw new AgentLlmError('El agente de código no devolvió archivos utilizables.', 'json_parse')
+   171→/home/z/my-project/src/lib/agent/pipeline.ts:344:        const project = await db.agentProject.findUnique({ where: { id: this.projectId }, select: { planJson: true } })
+   172→/home/z/my-project/src/lib/agent/pipeline.ts:345:        const existingFiles = await db.agentFile.findMany({ where: { projectId: this.projectId }, select: { path: true } })
+   173→/home/z/my-project/src/lib/agent/pipeline.ts:346:        const recent = await db.agentMessage.findMany({
+   174→/home/z/my-project/src/lib/agent/pipeline.ts:354:          .map((m) => `${m.role === 'user' ? 'Usuario' : 'Agente'}: ${m.content.slice(0, 220)}`)
+   175→/home/z/my-project/src/lib/agent/pipeline.ts:356:        await this.log('info', 'agente de código aplicando la petición sobre el proyecto existente')
+   176→/home/z/my-project/src/lib/agent/pipeline.ts:357:        const fu = await agentChatJson<{ summary?: unknown; files?: unknown }>(
+   177→/home/z/my-project/src/lib/agent/pipeline.ts:409:          throw new AgentLlmError(
+   178→/home/z/my-project/src/lib/agent/pipeline.ts:445:        this.thought('La verificación real falló. Leo el error real del servidor y activo al Agente Reparador.')
+   179→/home/z/my-project/src/lib/agent/pipeline.ts:463:        throw new AgentLlmError(
+   180→/home/z/my-project/src/lib/agent/pipeline.ts:475:      const savedFiles = await db.agentFile.findMany({
+   181→/home/z/my-project/src/lib/agent/pipeline.ts:494:      await db.agentProject.update({
+   182→/home/z/my-project/src/lib/agent/pipeline.ts:499:      const assistant = await db.agentMessage.create({
+   183→/home/z/my-project/src/lib/agent/pipeline.ts:531:  private async repair(errorText: string): Promise<AgentGeneratedFile[]> {
+   184→/home/z/my-project/src/lib/agent/pipeline.ts:532:    const files = await db.agentFile.findMany({
+   185→/home/z/my-project/src/lib/agent/pipeline.ts:551:    const fixer = await agentChatJson<{ files?: unknown; summary?: unknown }>(
+   186→/home/z/my-project/src/lib/agent/pipeline.ts:567:  private reportCore(core: AgentCore) {
+   187→/home/z/my-project/src/lib/agent/pipeline.ts:573:    const filesCount = await db.agentFile.count({ where: { projectId: this.projectId, path: { not: 'preview.html' } } })
+   188→/home/z/my-project/src/lib/agent/pipeline.ts:574:    await db.agentProject.update({
+   189→/home/z/my-project/src/lib/agent/pipeline.ts:582:    const isLlm = err instanceof AgentLlmError
+   190→/home/z/my-project/src/lib/agent/pipeline.ts:586:      : 'El agente no pudo completar el turno. Se conserva el progreso real del proyecto en disco.'
+   191→/home/z/my-project/src/lib/agent/pipeline.ts:587:    await this.log('error', `error del agente (${errorType}): ${message}`)
+   192→/home/z/my-project/src/lib/agent/pipeline.ts:588:    await db.agentProject.update({
+   193→/home/z/my-project/src/lib/agent/pipeline.ts:596:  private async loadPlan(): Promise<AgentPlan | null> {
+   194→/home/z/my-project/src/lib/agent/pipeline.ts:597:    const project = await db.agentProject.findUnique({ where: { id: this.projectId }, select: { planJson: true } })
+   195→/home/z/my-project/src/lib/agent/pipeline.ts:614:  const max = await db.agentLog.aggregate({ _max: { seq: true }, where: { projectId } })
+   196→/home/z/my-project/src/lib/agent/pipeline.ts:619:    return db.agentLog.create({ data: { projectId, seq: s, level, text: text.slice(0, 2000) } }).catch(() => undefined)
+   197→/home/z/my-project/src/lib/agent/runner.ts:2: * Runner REAL del Modo Agente de OE AI.
+   198→/home/z/my-project/src/lib/agent/runner.ts:6: *   (/home/z/oe-agent-workspace/<projectId>/).
+   199→/home/z/my-project/src/lib/agent/runner.ts:22:export const WORKSPACE_ROOT = '/home/z/oe-agent-workspace'
+   200→/home/z/my-project/src/lib/agent/runner.ts:53:  __oeAgentRunner?: {
+   201→/home/z/my-project/src/lib/agent/runner.ts:60:if (!g.__oeAgentRunner) {
+   202→/home/z/my-project/src/lib/agent/runner.ts:61:  g.__oeAgentRunner = { servers: new Map(), slotByPort: new Map() }
+   203→/home/z/my-project/src/lib/agent/runner.ts:63:const registry = g.__oeAgentRunner
+   204→/home/z/my-project/src/lib/agent/runner.ts:67:  return `/api/agent/projects/${projectId}/preview`
+   205→/home/z/my-project/src/lib/agent/runner.ts:238:  const project = await db.agentProject.findUnique({ where: { id: projectId }, select: { devPort: true } })
+   206→/home/z/my-project/src/lib/agent/runner.ts:298:    `pkill -f "oe-agent-workspace/${projectId}/node_modules/\\.[b]in/next" >/dev/null 2>&1 || true; sleep 0.6`,
+   207→/home/z/my-project/src/lib/agent/runner.ts:354:  await db.agentProject.update({ where: { id: projectId }, data: { devPort: port } }).catch(() => undefined)
+   208→/home/z/my-project/src/lib/agent/runner.ts:426:      headers: { 'accept-encoding': 'identity', 'user-agent': 'OEAI-Agent-Verifier/1.0' },
+   209→/home/z/my-project/src/lib/agent/types.ts:2: * Contratos del Modo Agente de OE AI (/agent).
+   210→/home/z/my-project/src/lib/agent/types.ts:4: * El agente orquesta varias invocaciones al núcleo LLM (planificador → código →
+   211→/home/z/my-project/src/lib/agent/types.ts:9:export const AGENT_MODES = ['fullstack', 'frontend', 'api', 'long'] as const
+   212→/home/z/my-project/src/lib/agent/types.ts:10:export type AgentMode = (typeof AGENT_MODES)[number]
+   213→/home/z/my-project/src/lib/agent/types.ts:12:export const AGENT_MODE_LABEL: Record<AgentMode, string> = {
+   214→/home/z/my-project/src/lib/agent/types.ts:19:export function isAgentMode(value: unknown): value is AgentMode {
+   215→/home/z/my-project/src/lib/agent/types.ts:20:  return typeof value === 'string' && (AGENT_MODES as readonly string[]).includes(value)
+   216→/home/z/my-project/src/lib/agent/types.ts:23:/** Fases visibles del agente (honestas: corresponden a pasos reales). */
+   217→/home/z/my-project/src/lib/agent/types.ts:24:export type AgentPhase = 'idle' | 'planning' | 'coding' | 'installing' | 'starting' | 'verifying' | 'ready' | 'error'
+   218→/home/z/my-project/src/lib/agent/types.ts:26:export const AGENT_PHASE_LABEL: Record<AgentPhase, string> = {
+   219→/home/z/my-project/src/lib/agent/types.ts:37:/** Estado de un todo del turno del agente (render estilo constructor). */
+   220→/home/z/my-project/src/lib/agent/types.ts:38:export type AgentTodoStatus = 'pending' | 'in_progress' | 'done' | 'error'
+   221→/home/z/my-project/src/lib/agent/types.ts:40:export interface AgentTodo {
+   222→/home/z/my-project/src/lib/agent/types.ts:43:  status: AgentTodoStatus
+   223→/home/z/my-project/src/lib/agent/types.ts:49:/** Plan producido por el agente planificador. */
+   224→/home/z/my-project/src/lib/agent/types.ts:50:export interface AgentPlan {
+   225→/home/z/my-project/src/lib/agent/types.ts:60:/** Archivo producido por el agente de código (contenido íntegro). */
+   226→/home/z/my-project/src/lib/agent/types.ts:61:export interface AgentGeneratedFile {
+   227→/home/z/my-project/src/lib/agent/types.ts:95:/** Eventos SSE del flujo del agente (POST /api/agent/*). */
+   228→/home/z/my-project/src/lib/agent/types.ts:96:export type AgentSseEvent =
+   229→/home/z/my-project/src/lib/agent/types.ts:97:  | { event: 'meta'; data: { projectId: string; title: string; phase: AgentPhase; mode: AgentMode } }
+   230→/home/z/my-project/src/lib/agent/types.ts:98:  | { event: 'phase'; data: { phase: AgentPhase; note?: string } }
+   231→/home/z/my-project/src/lib/agent/types.ts:100:  | { event: 'todo'; data: { id: string; label: string; status: AgentTodoStatus } }
+   232→/home/z/my-project/src/lib/agent/types.ts:101:  | { event: 'todos_reset'; data: { todos: AgentTodo[] } }
+   233→/home/z/my-project/src/lib/agent/types.ts:102:  | { event: 'plan'; data: { plan: AgentPlan } }
+   234→/home/z/my-project/src/lib/agent/types.ts:115:export interface AgentUiCmd {
+   235→/home/z/my-project/src/lib/agent/types.ts:127:/** Estado completo de un proyecto (GET /api/agent/projects/[id]). */
+   236→/home/z/my-project/src/lib/agent/types.ts:128:export interface AgentProjectState {
+   237→/home/z/my-project/src/lib/agent/types.ts:133:    mode: AgentMode
+   238→/home/z/my-project/src/lib/agent/types.ts:165:export interface AgentProjectSummary {
+   239→/home/z/my-project/src/lib/agent/types.ts:168:  mode: AgentMode
+   240→/home/z/my-project/src/components/chat/sidebar.tsx:222:      key: 'agent',
+   241→/home/z/my-project/src/components/chat/sidebar.tsx:223:      label: 'Agente',
+   242→/home/z/my-project/src/components/chat/sidebar.tsx:227:      action: () => window.location.assign('/agent'),
+   243→/home/z/my-project/src/components/chat/composer.tsx:563:                href="/agent"
+   244→/home/z/my-project/src/components/chat/composer.tsx:567:                Modo Agente · construir una app
+   245→/home/z/my-project/src/hooks/use-agent.ts:4: * useAgent — lógica del Modo Agente de OE AI (/agent). TODO REAL:
+   246→/home/z/my-project/src/hooks/use-agent.ts:6: * - POST /api/agent/projects (turno inicial) y /api/agent/projects/[id]/messages
+   247→/home/z/my-project/src/hooks/use-agent.ts:11: *   del proyecto vía POST /api/agent/projects/[id]/terminal (SSE).
+   248→/home/z/my-project/src/hooks/use-agent.ts:13: *   GET /api/agent/projects/[id] (mensajes, archivos, terminal, vercel).
+   249→/home/z/my-project/src/hooks/use-agent.ts:17:  AgentMode,
+   250→/home/z/my-project/src/hooks/use-agent.ts:18:  AgentPhase,
+   251→
+   252→[Showing results with pagination = limit: 250]

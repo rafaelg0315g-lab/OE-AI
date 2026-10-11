@@ -1,0 +1,743 @@
+    60→    60→  /** true: el constructor de apps está generando la app (aurora de puntos). */
+    61→    61→  pendingProject?: boolean
+    62→    62→  /** Fuentes web (búsqueda real) adjuntas a la respuesta. */
+    63→    63→  sources?: WebSource[]
+    64→    64→  /** Aviso honesto si la búsqueda web no estuvo disponible. */
+    65→    65→  searchNote?: string | null
+    66→    66→  /** Imagen adjuntada por el usuario (visión): /api/assets/[id]. */
+    67→    67→  attachmentUrl?: string | null
+    68→    68→  /** Fecha del servidor (solo mensajes restaurados del historial). */
+    69→    69→  createdAt?: string | null
+    70→    70→}
+    71→    71→
+    72→    72→export type ChatPhase = 'idle' | 'thinking' | 'typing'
+    73→    73→
+    74→    74→/** Resultado de las herramientas de medios (el diálogo muestra un toast honesto con él). */
+    75→    75→export type ToolResult = { ok: boolean; error?: string; errorType?: string }
+    76→    76→
+    77→    77→export interface ChatError {
+    78→    78→  message: string
+    79→    79→  errorType?: string
+    80→    80→}
+    81→    81→
+    82→    82→/** Cuota del chat para invitados: 5 chats gratis por sesión de navegador. */
+    83→    83→export interface GuestQuotaState {
+    84→    84→  used: number
+    85→    85→  limit: number
+    86→    86→  remaining: number
+    87→    87→  exhausted: boolean
+    88→    88→}
+    89→    89→
+    90→    90→const ACTIVE_KEY = 'oe-ai-active-session'
+    91→    91→
+    92→    92→function newId(): string {
+    93→    93→  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID()
+    94→    94→  return `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`
+    95→    95→}
+    96→    96→
+    97→    97→/* ── Constructor de apps / Web Factory: recuperación de builds ───────────── */
+    98→    98→
+    99→    99→/** Proyecto según /api/tools/build-app/status (detalle completo). */
+   100→   100→interface BuildStatusProject {
+   101→   101→  id: string
+   102→   102→  title?: string
+   103→   103→  status?: string
+   104→   104→  mode?: string
+   105→   105→  stack?: string
+   106→   106→  errorType?: string | null
+   107→   107→  summary?: string
+   108→   108→  createdAt: string
+   109→   109→  files?: Array<{ path: string; language?: string; bytes?: number }>
+   110→   110→  previewUrl?: string
+   111→   111→  designSystem?: Record<string, string>
+   112→   112→  references?: Array<{ name: string; repoUrl: string; license: string; usage: string }>
+   113→   113→  checks?: Array<{ check: string; status: string; detail: string }>
+   114→   114→  warnings?: string[]
+   115→   115→}
+   116→   116→
+   117→   117→/** Proyecto en versión ligera (lista del endpoint de estado). */
+   118→   118→interface BuildStatusSummary {
+   119→   119→  id: string
+   120→   120→  title: string
+   121→   121→  status: string
+   122→   122→  mode: string
+   123→   123→  errorType: string | null
+   124→   124→  createdAt: string
+   125→   125→  updatedAt: string
+   126→   126→}
+   127→   127→
+   128→   128→const BUILD_POLL_INTERVAL_MS = 4000
+   129→   129→const BUILD_POLL_MAX_MS = 8 * 60_000
+   130→   130→
+   131→   131→/** Explicación honesta del errorType del pipeline de construcción. */
+   132→   132→function describeBuildError(errorType?: string | null): string {
+   133→   133→  switch (errorType) {
+   134→   134→    case 'no_files':
+   135→   135→      return 'el núcleo no devolvió archivos utilizables (inténtalo de nuevo).'
+   136→   136→    case 'rate_limited':
+   137→   137→      return 'el núcleo alcanzó su límite de peticiones; espera un momento e inténtalo de nuevo.'
+   138→   138→    case 'empty_response':
+   139→   139→      return 'el núcleo devolvió una respuesta vacía.'
+   140→   140→    case 'json_parse':
+   141→   141→      return 'la respuesta del núcleo no se pudo interpretar.'
+   142→   142→    case 'provider_error':
+   143→   143→      return 'el proveedor de código falló.'
+   144→   144→    case 'invalid_plan':
+   145→   145→      return 'el plan generado no fue válido.'
+   146→   146→    case 'aborted':
+   147→   147→      return 'la construcción se canceló.'
+   148→   148→    default:
+   149→   149→      return 'error interno del constructor.'
+   150→   150→  }
+   151→   151→}
+   152→   152→
+   153→   153→/** Contenido del mensaje con el bloque ```oeproject (tarjetas de archivos). */
+   154→   154→function oeProjectContent(
+   155→   155→  prefix: string,
+   156→   156→  data: {
+   157→   157→    id: string
+   158→   158→    title?: string
+   159→   159→    summary?: string
+   160→   160→    mode?: string
+   161→   161→    stack?: string
+   162→   162→    isUpdate?: boolean
+   163→   163→    changedPaths?: string[]
+   164→   164→    files?: Array<{ path: string; language?: string; bytes?: number }>
+   165→   165→    previewUrl?: string
+   166→   166→    designSystem?: Record<string, string>
+   167→   167→    references?: Array<{ name: string; repoUrl: string; license: string; usage: string }>
+   168→   168→    checks?: Array<{ check: string; status: string; detail: string }>
+   169→   169→    warnings?: string[]
+   170→   170→  },
+   171→   171→  isWeb: boolean,
+   172→   172→): string {
+   173→   173→  const projectJson = JSON.stringify({
+   174→   174→    id: data.id,
+   175→   175→    title: data.title ?? (isWeb ? 'Sitio construido' : 'App construida'),
+   176→   176→    summary: data.summary ?? '',
+   177→   177→    mode: data.mode ?? (isWeb ? 'web' : 'frontend'),
+   178→   178→    kind: isWeb ? 'web' : 'app',
+   179→   179→    ...(data.isUpdate ? { isUpdate: true, changedPaths: data.changedPaths ?? [] } : {}),
+   180→   180→    files: data.files ?? [],
+   181→   181→    ...(isWeb
+   182→   182→      ? {
+   183→   183→          previewUrl: data.previewUrl,
+   184→   184→          stack: data.stack,
+   185→   185→          designSystem: data.designSystem,
+   186→   186→          references: data.references,
+   187→   187→          checks: data.checks,
+   188→   188→          warnings: data.warnings,
+   189→   189→        }
+   190→   190→      : {}),
+   191→   191→  })
+   192→   192→  return `${prefix ? `${prefix}\n\n` : ''}\`\`\`oeproject\n${projectJson}\n\`\`\``
+   193→   193→}
+   194→   194→
+   195→   195→/** Nota de error persistida por el constructor (se usa en el healing). */
+   196→   196→const BUILD_ERROR_NOTE_RE = /⚠️ No se pudo (?:construir|completar|iniciar) la (?:app|web|construcción)/
+   197→   197→
+   198→   198→/**
+   199→   199→ * Extrae la directiva ```oe-build del texto del asistente (constructor de apps).
+   200→   200→ * Devuelve el brief refinado y el texto de anuncio previo a la valla.
+   201→   201→ */
+   202→   202→interface BuildDirectivePayload {
+   203→   203→  name?: string
+   204→   204→  brief: string
+   205→   205→  mode?: string
+   206→   206→  projectId?: string
+   207→   207→  kind: 'app' | 'web'
+   208→   208→  prefix: string
+   209→   209→}
+   210→   210→
+   211→   211→function extractBuildDirective(text: string): BuildDirectivePayload | null {
+   212→   212→  const webIdx = text.indexOf('```oe-web')
+   213→   213→  const appIdx = text.indexOf('```oe-build')
+   214→   214→  const kind: 'app' | 'web' = webIdx !== -1 && (appIdx === -1 || webIdx < appIdx) ? 'web' : 'app'
+   215→   215→  const fenceStart = kind === 'web' ? webIdx : appIdx
+   216→   216→  if (fenceStart === -1) return null
+   217→   217→  const bodyStart = text.indexOf('\n', fenceStart)
+   218→   218→  if (bodyStart === -1) return null
+   219→   219→  const fenceEnd = text.indexOf('```', bodyStart)
+   220→   220→  if (fenceEnd === -1) return null
+   221→   221→  const raw = text.slice(bodyStart, fenceEnd).trim()
+   222→   222→  const start = raw.indexOf('{')
+   223→   223→  if (start === -1) return null
+   224→   224→  let depth = 0
+   225→   225→  let inString = false
+   226→   226→  let escaped = false
+   227→   227→  let end = -1
+   228→   228→  for (let i = start; i < raw.length; i++) {
+   229→   229→    const ch = raw[i]
+   230→   230→    if (inString) {
+   231→   231→      if (escaped) escaped = false
+   232→   232→      else if (ch === '\\') escaped = true
+   233→   233→      else if (ch === '"') inString = false
+   234→   234→      continue
+   235→   235→    }
+   236→   236→    if (ch === '"') inString = true
+   237→   237→    else if (ch === '{') depth++
+   238→   238→    else if (ch === '}') {
+   239→   239→      depth--
+   240→   240→      if (depth === 0) {
+   241→   241→        end = i
+   242→   242→        break
+   243→   243→      }
+   244→   244→    }
+   245→   245→  }
+   246→   246→  if (end === -1) return null
+   247→   247→  try {
+   248→   248→    const parsed = JSON.parse(raw.slice(start, end + 1)) as {
+   249→   249→      name?: unknown
+   250→   250→      brief?: unknown
+   251→   251→      mode?: unknown
+   252→   252→      projectId?: unknown
+   253→   253→    }
+   254→   254→    const brief = typeof parsed.brief === 'string' ? parsed.brief.trim() : ''
+   255→   255→    if (!brief) return null
+   256→   256→    const prefix = text
+   257→   257→      .slice(0, fenceStart)
+   258→   258→      .replace(/```[a-z]*\s*$/, '')
+   259→   259→      .trim()
+   260→   260→    return {
+   261→   261→      brief: brief.slice(0, 6000),
+   262→   262→      name: typeof parsed.name === 'string' ? parsed.name : undefined,
+   263→   263→      mode: typeof parsed.mode === 'string' ? parsed.mode : undefined,
+   264→   264→      projectId: typeof parsed.projectId === 'string' ? parsed.projectId : undefined,
+   265→   265→      kind,
+   266→   266→      prefix,
+   267→   267→    }
+   268→   268→  } catch {
+   269→   269→    return null
+   270→   270→  }
+   271→   271→}
+   272→   272→
+   273→   273→/** Restaura el último proyecto construido desde el historial (bloques oeproject). */
+   274→   274→function extractLastBuildFromHistory(
+   275→   275→  messages: Array<{ content: string }>,
+   276→   276→): { projectId: string; title: string; files: string[]; kind: 'app' | 'web' } | null {
+   277→   277→  const re = /```oeproject\s*\n([\s\S]*?)```/g
+   278→   278→  let last: { projectId: string; title: string; files: string[]; kind: 'app' | 'web' } | null = null
+   279→   279→  for (const m of messages) {
+   280→   280→    let match: RegExpExecArray | null
+   281→   281→    re.lastIndex = 0
+   282→   282→    while ((match = re.exec(m.content)) !== null) {
+   283→   283→      try {
+   284→   284→        const data = JSON.parse(match[1]) as { id?: unknown; title?: unknown; kind?: unknown; files?: Array<{ path?: unknown }> }
+   285→   285→        if (typeof data.id === 'string' && Array.isArray(data.files)) {
+   286→   286→          last = {
+   287→   287→            projectId: data.id,
+   288→   288→            title: typeof data.title === 'string' ? data.title : 'App construida',
+   289→   289→            files: data.files
+   290→   290→              .map((f) => (typeof f?.path === 'string' ? f.path : ''))
+   291→   291→              .filter(Boolean)
+   292→   292→              .slice(0, 12),
+   293→   293→            kind: data.kind === 'web' ? 'web' : 'app',
+   294→   294→          }
+   295→   295→        }
+   296→   296→      } catch {
+   297→   297→        // bloque inválido: ignorar
+   298→   298→      }
+   299→   299→    }
+   300→   300→  }
+   301→   301→  return last
+   302→   302→}
+   303→   303→
+   304→   304→export function useOeChat() {
+   305→   305→  const [conversations, setConversations] = useState<ConversationSummary[]>([])
+   306→   306→  const [activeId, setActiveId] = useState<string | null>(null)
+   307→   307→  const [messages, setMessages] = useState<ChatMsg[]>([])
+   308→   308→  const [phase, setPhase] = useState<ChatPhase>('idle')
+   309→   309→  const [error, setError] = useState<ChatError | null>(null)
+   310→   310→  const [routeNote, setRouteNote] = useState<string | null>(null)
+   311→   311→  const [focusModel, setFocusModel] = useState<string | null>(null)
+   312→   312→  const [loadingHistory, setLoadingHistory] = useState(false)
+   313→   313→  const [lastUserMsg, setLastUserMsg] = useState<string | null>(null)
+   314→   314→  const [webSearching, setWebSearching] = useState(false)
+   315→   315→  const [imagePending, setImagePending] = useState(false)
+   316→   316→  const [guestQuota, setGuestQuota] = useState<GuestQuotaState | null>(null)
+   317→   317→  const [guestBlocked, setGuestBlocked] = useState(false)
+   318→   318→
+   319→   319→  const abortRef = useRef<AbortController | null>(null)
+   320→   320→  const rafRef = useRef<number | null>(null)
+   321→   321→  const activeIdRef = useRef<string | null>(null)
+   322→   322→  const pendingRef = useRef(false)
+   323→   323→  const lastOptsRef = useRef<{ webSearch?: boolean; attachment?: { assetId: string; previewUrl: string } }>({})
+   324→   324→  /** Último proyecto construido en la conversación activa (para modificaciones). */
+   325→   325→  const lastBuildRef = useRef<{ projectId: string; title: string; files: string[]; kind: 'app' | 'web' } | null>(null)
+   326→   326→  const auth = useAuth()
+   327→   327→
+   328→   328→  useEffect(() => {
+   329→   329→    activeIdRef.current = activeId
+   330→   330→  }, [activeId])
+   331→   331→
+   332→   332→  /** Estado de la cuota (GET /api/chat/quota): nula si hay sesión iniciada.
+   333→   333→   *  IMPORTANTE: envía el token de Supabase cuando existe — sin él el endpoint
+   334→   334→   *  sigue viendo la cookie de invitado agotada y volvía a bloquear a usuarios
+   335→   335→   *  que YA habían iniciado sesión (la respuesta asíncrona reactivaba la
+   336→   336→   *  compuerta después de que el efecto la levantaba). */
+   337→   337→  const refreshQuota = useCallback(async () => {
+   338→   338→    try {
+   339→   339→      const token = await auth.getAccessToken().catch(() => null)
+   340→   340→      const res = await fetch('/api/chat/quota', {
+   341→   341→        cache: 'no-store',
+   342→   342→        ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+   343→   343→      })
+   344→   344→      if (!res.ok) return
+   345→   345→      const data = (await res.json()) as {
+   346→   346→        authenticated: boolean
+   347→   347→        used: number | null
+   348→   348→        limit: number | null
+   349→   349→        remaining: number | null
+   350→   350→        exhausted?: boolean
+   351→   351→      }
+   352→   352→      if (data.authenticated) {
+   353→   353→        setGuestQuota(null)
+   354→   354→        setGuestBlocked(false)
+   355→   355→        return
+   356→   356→      }
+   357→   357→      const state: GuestQuotaState = {
+   358→   358→        used: data.used ?? 0,
+   359→   359→        limit: data.limit ?? 5,
+   360→   360→        remaining: data.remaining ?? 0,
+   361→   361→        exhausted: Boolean(data.exhausted),
+   362→   362→      }
+   363→   363→      setGuestQuota(state)
+   364→   364→      // Con sesión iniciada el servidor ignora la cuota de invitado: nunca bloquear.
+   365→   365→      if (state.exhausted && !auth.user) setGuestBlocked(true)
+   366→   366→    } catch {
+   367→   367→      // sin estado de cuota visible; el servidor seguirá aplicándola
+   368→   368→    }
+   369→   369→  }, [auth])
+   370→   370→
+   371→   371→  // Cuota al arrancar y al cambiar la sesión (login/cierre): tras iniciar sesión
+   372→   372→  // la compuerta se levanta (usuarios verificados: chats ilimitados).
+   373→   373→  useEffect(() => {
+   374→   374→    void refreshQuota()
+   375→   375→    if (auth.user) setGuestBlocked(false)
+   376→   376→  }, [auth.user, refreshQuota])
+   377→   377→
+   378→   378→  // Sincroniza el enfoque de red (chatModel del store) con el estado local,
+   379→   379→  // también cuando cambia estando montado (p. ej. "Usar en el chat" desde Conexiones).
+   380→   380→  useEffect(() => {
+   381→   381→    const syncFocus = (model: string) => {
+   382→   382→      setFocusModel(model && model !== 'auto' ? model : null)
+   383→   383→    }
+   384→   384→    syncFocus(useUiStore.getState().chatModel)
+   385→   385→    return useUiStore.subscribe((state) => syncFocus(state.chatModel))
+   386→   386→  }, [])
+   387→   387→
+   388→   388→  /** Lista de conversaciones para sidebar/buscador. */
+   389→   389→  const refreshConversations = useCallback(async () => {
+   390→   390→    try {
+   391→   391→      const res = await fetch('/api/chat/sessions')
+   392→   392→      if (!res.ok) return
+   393→   393→      const data = (await res.json()) as { sessions?: ConversationSummary[] }
+   394→   394→      if (data.sessions) {
+   395→   395→        setConversations(data.sessions.filter((s) => s.messageCount > 0))
+   396→   396→        useUiStore.getState().setConversations(data.sessions.filter((s) => s.messageCount > 0))
+   397→   397→      }
+   398→   398→    } catch {
+   399→   399→      // sin historial visible; la app sigue funcionando
+   400→   400→    }
+   401→   401→  }, [])
+   402→   402→
+   403→   403→  /** Consulta el estado real de un build (apps y webs) sin cuota. */
+   404→   404→  const fetchBuildStatus = useCallback(async (convId: string, projectId?: string): Promise<BuildStatusProject | null> => {
+   405→   405→    try {
+   406→   406→      const params = new URLSearchParams({ sessionId: convId })
+   407→   407→      if (projectId) params.set('projectId', projectId)
+   408→   408→      const res = await fetch(`/api/tools/build-app/status?${params.toString()}`, { cache: 'no-store' })
+   409→   409→      if (!res.ok) return null
+   410→   410→      const data = (await res.json().catch(() => null)) as { project?: BuildStatusProject | null } | null
+   411→   411→      return data?.project ?? null
+   412→   412→    } catch {
+   413→   413→      return null
+   414→   414→    }
+   415→   415→  }, [])
+   416→   416→
+   417→   417→  /**
+   418→   418→   * Sondeo tras un fallo de conexión del POST de construcción (502 del gateway,
+   419→   419→   * red, recarga): el build sigue en el servidor. Cuando el proyecto queda
+   420→   420→   * listo, las tarjetas de archivos aparecen solas, sin recargar la página.
+   421→   421→   */
+   422→   422→  const resolveBuildByStatus = useCallback(
+   423→   423→    async (args: {
+   424→   424→      convId: string
+   425→   425→      assistantId: string
+   426→   426→      serverMessageId: string | null
+   427→   427→      projectId?: string
+   428→   428→      startedAt: number
+   429→   429→      prefix: string
+   430→   430→      isWeb: boolean
+   431→   431→      fallbackError: string
+   432→   432→    }) => {
+   433→   433→      const { convId, assistantId, serverMessageId, projectId, startedAt, prefix, isWeb, fallbackError } = args
+   434→   434→      const persist = (content: string) => {
+   435→   435→        if (!serverMessageId) return
+   436→   436→        void fetch('/api/chat/messages', {
+   437→   437→          method: 'PATCH',
+   438→   438→          headers: { 'Content-Type': 'application/json' },
+   439→   439→          body: JSON.stringify({ id: serverMessageId, content }),
+   440→   440→        }).catch(() => undefined)
+   441→   441→      }
+   442→   442→      const finish = (content: string, persistIt: boolean) => {
+   443→   443→        setMessages((prev) =>
+   444→   444→          prev.map((m) =>
+   445→   445→            m.id === assistantId ? { ...m, content, fullContent: content, pendingProject: false, complete: true } : m,
+   446→   446→          ),
+   447→   447→        )
+   448→   448→        if (persistIt) persist(content)
+   449→   449→      }
+   450→   450→      const deadline = Date.now() + BUILD_POLL_MAX_MS
+   451→   451→      let lastSeenBuilding = false
+   452→   452→      while (Date.now() < deadline) {
+   453→   453→        await new Promise((r) => setTimeout(r, BUILD_POLL_INTERVAL_MS))
+   454→   454→        const p = await fetchBuildStatus(convId, projectId)
+   455→   455→        if (!p) continue
+   456→   456→        const matches = p.id === projectId || new Date(p.createdAt).getTime() >= startedAt - 5000
+   457→   457→        if (!matches) continue
+   458→   458→        if (p.status === 'ready' && Array.isArray(p.files) && p.files.length > 0) {
+   459→   459→          const newContent = oeProjectContent(prefix, p, isWeb)
+   460→   460→          finish(newContent, true)
+   461→   461→          lastBuildRef.current = {
+   462→   462→            projectId: p.id,
+   463→   463→            title: p.title ?? 'App construida',
+   464→   464→            files: (p.files ?? []).map((f) => f.path).slice(0, 12),
+   465→   465→            kind: isWeb ? 'web' : 'app',
+   466→   466→          }
+   467→   467→          void refreshQuota()
+   468→   468→          void refreshConversations()
+   469→   469→          return
+   470→   470→        }
+   471→   471→        if (p.status === 'error') {
+   472→   472→          // Fallo definitivo del pipeline: nota honesta persistida.
+   473→   473→          finish(`${prefix ? `${prefix}\n\n` : ''}⚠️ No se pudo completar la construcción: ${describeBuildError(p.errorType)}`, true)
+   474→   474→          return
+   475→   475→        }
+   476→   476→        lastSeenBuilding = p.status === 'building'
+   477→   477→      }
+   478→   478→      if (lastSeenBuilding) {
+   479→   479→        // El build sigue en curso tras el plazo: aviso SOLO local (sin PATCH)
+   480→   480→        // para no borrar la directiva; al recargar, el healing la recupera.
+   481→   481→        finish(`${prefix ? `${prefix}\n\n` : ''}⏳ La construcción sigue en curso en el servidor. Recarga la conversación en un momento para ver el resultado.`, false)
+   482→   482→        return
+   483→   483→      }
+   484→   484→      finish(`${prefix ? `${prefix}\n\n` : ''}⚠️ No se pudo iniciar la construcción: ${fallbackError}`, true)
+   485→   485→    },
+   486→   486→    [fetchBuildStatus, refreshConversations, refreshQuota],
+   487→   487→  )
+   488→   488→
+   489→   489→  /**
+   490→   490→   * Recuperación al cargar una conversación: mensajes con directiva
+   491→   491→   * ```oe-build/```oe-web sin resolver (o nota de error del constructor) se
+   492→   492→   * contrastan con el estado real del servidor. Si el proyecto terminó listo,
+   493→   493→   * las tarjetas se muestran sin que el usuario tenga que hacer nada.
+   494→   494→   */
+   495→   495→  const healUnresolvedBuilds = useCallback(
+   496→   496→    async (convId: string, msgs: ChatMsg[]) => {
+   497→   497→      if (msgs.length === 0) return
+   498→   498→      let projects: BuildStatusSummary[] | null = null
+   499→   499→      try {
+   500→   500→        const res = await fetch(`/api/tools/build-app/status?sessionId=${encodeURIComponent(convId)}`, { cache: 'no-store' })
+   501→   501→        if (res.ok) {
+   502→   502→          const data = (await res.json().catch(() => null)) as { projects?: BuildStatusSummary[] } | null
+   503→   503→          projects = data?.projects ?? null
+   504→   504→        }
+   505→   505→      } catch {
+   506→   506→        return
+   507→   507→      }
+   508→   508→      if (!projects || projects.length === 0) return
+   509→   509→
+   510→   510→      for (let i = 0; i < msgs.length; i++) {
+   511→   511→        const msg = msgs[i]
+   512→   512→        if (msg.role !== 'assistant') continue
+   513→   513→        const content = msg.fullContent || msg.content
+   514→   514→        if (content.includes('```oeproject')) continue
+   515→   515→        const directive = extractBuildDirective(content)
+   516→   516→        const isBuildErrorNote = !directive && BUILD_ERROR_NOTE_RE.test(content)
+   517→   517→        if (!directive && !isBuildErrorNote) continue
+   518→   518→
+   519→   519→        // Emparejar el mensaje con su proyecto: por projectId explícito
+   520→   520→        // (modificaciones) o por ventana temporal (creación ≤ mensaje < siguiente).
+   521→   521→        let match: BuildStatusSummary | undefined
+   522→   522→        if (directive?.projectId) match = projects.find((p) => p.id === directive.projectId)
+   523→   523→        if (!match) {
+   524→   524→          const lower = msg.createdAt ? new Date(msg.createdAt).getTime() - 2000 : 0
+   525→   525→          const nextWithTs = msgs.slice(i + 1).find((m) => m.createdAt)
+   526→   526→          const upper = nextWithTs?.createdAt ? new Date(nextWithTs.createdAt).getTime() : Date.now() + 60_000
+   527→   527→          match = projects.find((p) => {
+   528→   528→            const ts = new Date(p.updatedAt || p.createdAt).getTime()
+   529→   529→            return ts >= lower && ts <= upper
+   530→   530→          })
+   531→   531→        }
+   532→   532→        if (!match) continue
+   533→   533→
+   534→   534→        const detail = await fetchBuildStatus(convId, match.id)
+   535→   535→        if (!detail) continue
+   536→   536→        const isWeb = detail.mode === 'web'
+   537→   537→        const waiting = isWeb ? 'Diseñando tu sitio web…' : 'Construyendo tu app…'
+   538→   538→        const prefix = directive
+   539→   539→          ? directive.prefix
+   540→   540→          : content.split('\n⚠️')[0].replace(/```[a-z]*\s*$/, '').trim()
+   541→   541→
+   542→   542→        if (detail.status === 'ready' && Array.isArray(detail.files) && detail.files.length > 0) {
+   543→   543→          const newContent = oeProjectContent(prefix, detail, isWeb)
+   544→   544→          setMessages((prev) =>
+   545→   545→            prev.map((m) =>
+   546→   546→              m.id === msg.id ? { ...m, content: newContent, fullContent: newContent, pendingProject: false, complete: true } : m,
+   547→   547→            ),
+   548→   548→          )
+   549→   549→          void fetch('/api/chat/messages', {
+   550→   550→            method: 'PATCH',
+   551→   551→            headers: { 'Content-Type': 'application/json' },
+   552→   552→            body: JSON.stringify({ id: msg.id, content: newContent }),
+   553→   553→          }).catch(() => undefined)
+   554→   554→          lastBuildRef.current = {
+   555→   555→            projectId: detail.id,
+   556→   556→            title: detail.title ?? 'App construida',
+   557→   557→            files: (detail.files ?? []).map((f) => f.path).slice(0, 12),
+   558→   558→            kind: isWeb ? 'web' : 'app',
+   559→   559→          }
+   560→   560→        } else if (detail.status === 'building') {
+   561→   561→          // Reanudar en vivo: aurora + sondeo hasta la resolución real.
+   562→   562→          setMessages((prev) =>
+   563→   563→            prev.map((m) =>
+   564→   564→              m.id === msg.id ? { ...m, content: prefix || waiting, fullContent: prefix || waiting, pendingProject: true, complete: true } : m,
+   565→   565→            ),
+   566→   566→          )
+   567→   567→          await resolveBuildByStatus({
+   568→   568→            convId,
+   569→   569→            assistantId: msg.id,
+   570→   570→            serverMessageId: msg.id,
+   571→   571→            projectId: detail.id,
+   572→   572→            startedAt: new Date(detail.createdAt).getTime(),
+   573→   573→            prefix,
+   574→   574→            isWeb,
+   575→   575→            fallbackError: 'la construcción tardó demasiado en responder.',
+   576→   576→          })
+   577→   577→        } else if (detail.status === 'error') {
+   578→   578→          const note = `${prefix ? `${prefix}\n\n` : ''}⚠️ No se pudo completar la construcción: ${describeBuildError(detail.errorType)}`
+   579→   579→          setMessages((prev) =>
+   580→   580→            prev.map((m) =>
+   581→   581→              m.id === msg.id ? { ...m, content: note, fullContent: note, pendingProject: false, complete: true } : m,
+   582→   582→            ),
+   583→   583→          )
+   584→   584→          void fetch('/api/chat/messages', {
+   585→   585→            method: 'PATCH',
+   586→   586→            headers: { 'Content-Type': 'application/json' },
+   587→   587→            body: JSON.stringify({ id: msg.id, content: note }),
+   588→   588→          }).catch(() => undefined)
+   589→   589→        }
+   590→   590→      }
+   591→   591→    },
+   592→   592→    [fetchBuildStatus, resolveBuildByStatus],
+   593→   593→  )
+   594→   594→
+   595→   595→  /** Carga los mensajes de una conversación existente (texto e imágenes). */
+   596→   596→  const loadConversation = useCallback(async (id: string) => {
+   597→   597→    if (pendingRef.current) return
+   598→   598→    setError(null)
+   599→   599→    setRouteNote(null)
+   600→   600→    setLoadingHistory(true)
+   601→   601→    try {
+   602→   602→      const res = await fetch(`/api/chat/history?sessionId=${encodeURIComponent(id)}`)
+   603→   603→      if (!res.ok) return
+   604→   604→      const data = (await res.json()) as { messages?: Array<Record<string, unknown>> }
+   605→   605→      const restored: ChatMsg[] = (data.messages ?? []).map((m) => {
+   606→   606→        const kind = m.kind === 'image' ? 'image' : 'text'
+   607→   607→        const role = m.role === 'user' ? ('user' as const) : ('assistant' as const)
+   608→   608→        let sources: WebSource[] | undefined
+   609→   609→        if (typeof m.sourcesJson === 'string' && m.sourcesJson) {
+   610→   610→          try {
+   611→   611→            const parsed = JSON.parse(m.sourcesJson) as WebSource[]
+   612→   612→            if (Array.isArray(parsed) && parsed.length) sources = parsed
+   613→   613→          } catch {
+   614→   614→            // JSON inválido: se ignora
+   615→   615→          }
+   616→   616→        }
+   617→   617→        return {
+   618→   618→          id: String(m.id),
+   619→   619→          role,
+   620→   620→          content: String(m.content ?? ''),
+   621→   621→          fullContent: String(m.content ?? ''),
+   622→   622→          complete: true,
+   623→   623→          kind,
+   624→   624→          assetUrl: kind === 'image' && typeof m.assetId === 'string' ? `/api/assets/${m.assetId}` : null,
+   625→   625→          attachmentUrl: role === 'user' && typeof m.attachmentAssetId === 'string' ? `/api/assets/${m.attachmentAssetId}` : null,
+   626→   626→          sources,
+   627→   627→          createdAt: typeof m.createdAt === 'string' ? m.createdAt : null,
+   628→   628→          meta: {
+   629→   629→            providerReportedModel: (m.providerReportedModel as string) ?? null,
+   630→   630→            routeNote: (m.resolvedModelId as string) ?? null,
+   631→   631→          },
+   632→   632→        }
+   633→   633→      })
+   634→   634→      setMessages(restored)
+   635→   635→      setActiveId(id)
+   636→   636→      activeIdRef.current = id
+   637→   637→      // Continuidad del constructor: el último proyecto construido de ESTA conversación.
+   638→   638→      lastBuildRef.current = extractLastBuildFromHistory(restored.map((m) => ({ content: m.fullContent })))
+   639→   639→      // Recuperación: directivas/notas de build sin resolver → estado real del servidor.
+   640→   640→      void healUnresolvedBuilds(id, restored)
+   641→   641→      try {
+   642→   642→        window.localStorage.setItem(ACTIVE_KEY, id)
+   643→   643→      } catch {
+   644→   644→        // almacenamiento no disponible
+   645→   645→      }
+   646→   646→    } finally {
+   647→   647→      setLoadingHistory(false)
+   648→   648→    }
+   649→   649→  }, [healUnresolvedBuilds])
+   650→   650→
+   651→   651→  // Arranque: historial + restauración de la conversación activa + enfoque desde /apis
+   652→   652→  useEffect(() => {
+   653→   653→    void refreshConversations()
+   654→   654→    let initialId: string | null = null
+   655→   655→    try {
+   656→   656→      initialId = window.localStorage.getItem(ACTIVE_KEY)
+   657→   657→    } catch {
+   658→   658→      // sin almacenamiento
+   659→   659→    }
+   660→   660→    if (initialId) void loadConversation(initialId)
+   661→   661→
+   662→   662→    // Enfoque de red llegado desde el Centro de APIs (/apis)
+   663→   663→    try {
+   664→   664→      const pending = window.sessionStorage.getItem('oe-ai-pending-model')
+   665→   665→      if (pending) {
+   666→   666→        window.sessionStorage.removeItem('oe-ai-pending-model')
+   667→   667→        useUiStore.getState().openChatWithModel(pending)
+   668→   668→      }
+   669→   669→    } catch {
+   670→   670→      // ignorar
+   671→   671→    }
+   672→   672→    const focus = useUiStore.getState().chatModel
+   673→   673→    if (focus && focus !== 'auto') setFocusModel(focus)
+   674→   674→  }, [loadConversation, refreshConversations])
+   675→   675→
+   676→   676→  /** Revelación progresiva (máquina de escribir adaptativa, duración acotada).
+   677→   677→   *  Contenido estructurado (tablas/código): sin typewriter → render Markdown
+   678→   678→   *  inmediato y bien formateado (nunca se ve la sintaxis cruda). */
+   679→   679→  const startTypewriter = useCallback((assistantId: string, full: string) => {
+   680→   680→    if (/```|(^|\n)\s*\|/.test(full)) {
+   681→   681→      setMessages((prev) =>
+   682→   682→        prev.map((m) => (m.id === assistantId ? { ...m, content: full, complete: true } : m)),
+   683→   683→      )
+   684→   684→      setPhase('idle')
+   685→   685→      return
+   686→   686→    }
+   687→   687→    setPhase('typing')
+   688→   688→    const duration = Math.min(2400, Math.max(700, full.length * 4))
+   689→   689→    const start = performance.now()
+   690→   690→    const step = (now: number) => {
+   691→   691→      const p = Math.min(1, (now - start) / duration)
+   692→   692→      const eased = 1 - Math.pow(1 - p, 2.1)
+   693→   693→      const chars = Math.max(1, Math.floor(eased * full.length))
+   694→   694→      setMessages((prev) =>
+   695→   695→        prev.map((m) => (m.id === assistantId ? { ...m, content: full.slice(0, chars) } : m)),
+   696→   696→      )
+   697→   697→      if (p < 1) {
+   698→   698→        rafRef.current = requestAnimationFrame(step)
+   699→   699→      } else {
+   700→   700→        setMessages((prev) =>
+   701→   701→          prev.map((m) => (m.id === assistantId ? { ...m, content: full, complete: true } : m)),
+   702→   702→        )
+   703→   703→        setPhase('idle')
+   704→   704→      }
+   705→   705→    }
+   706→   706→    rafRef.current = requestAnimationFrame(step)
+   707→   707→  }, [])
+   708→   708→
+   709→   709→  /**
+   710→   710→   * Flujo del Constructor de Apps: el asistente emitió una directiva ```oe-build.
+   711→   711→   * Reemplaza la directiva por el placeholder aurora, llama a
+   712→   712→   * /api/tools/build-app y actualiza el mensaje con el bloque ```oeproject
+   713→   713→   * (tarjetas de archivos + descarga .zip), persistiendo el cambio.
+   714→   714→   */
+   715→   715→  const runBuildFlow = useCallback(
+   716→   716→    async (
+   717→   717→      directive: { brief: string; mode?: string; projectId?: string; kind: 'app' | 'web'; prefix: string },
+   718→   718→      assistantId: string,
+   719→   719→      serverMessageId: string,
+   720→   720→      convId: string,
+   721→   721→    ) => {
+   722→   722→      const prefix = directive.prefix
+   723→   723→      const isWeb = directive.kind === 'web'
+   724→   724→      const waiting = prefix || (isWeb ? 'Diseñando tu sitio web…' : 'Construyendo tu app…')
+   725→   725→      const startedAt = Date.now()
+   726→   726→      setMessages((prev) =>
+   727→   727→        prev.map((m) =>
+   728→   728→          m.id === assistantId
+   729→   729→            ? { ...m, content: waiting, fullContent: waiting, pendingProject: true, complete: true }
+   730→   730→            : m,
+   731→   731→        ),
+   732→   732→      )
+   733→   733→      try {
+   734→   734→        const token = await auth.getAccessToken()
+   735→   735→        const res = await fetch(isWeb ? '/api/web-factory/generate' : '/api/tools/build-app', {
+   736→   736→          method: 'POST',
+   737→   737→          headers: {
+   738→   738→            'Content-Type': 'application/json',
+   739→   739→            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+   740→   740→          },
+   741→   741→          body: JSON.stringify({
+   742→   742→            sessionId: convId,
+   743→   743→            brief: directive.brief,
+   744→   744→            mode: directive.mode,
+   745→   745→            projectId: directive.projectId,
+   746→   746→          }),
+   747→   747→        })
+   748→   748→        const data = (await res.json().catch(() => null)) as {
+   749→   749→          id?: string
+   750→   750→          title?: string
+   751→   751→          summary?: string
+   752→   752→          mode?: string
+   753→   753→          stack?: string
+   754→   754→          isUpdate?: boolean
+   755→   755→          changedPaths?: string[]
+   756→   756→          files?: Array<{ path: string; language: string; bytes: number }>
+   757→   757→          latencyMs?: number
+   758→   758→          error?: string
+   759→   759→          errorType?: string
+   760→   760→          // Campos extra de Web Factory (vista previa, diseño, procedencia, validación)
+   761→   761→          previewUrl?: string
+   762→   762→          designSystem?: Record<string, string>
+   763→   763→          references?: Array<{ name: string; repoUrl: string; license: string; usage: string }>
+   764→   764→          checks?: Array<{ check: string; status: string; detail: string }>
+   765→   765→          warnings?: string[]
+   766→   766→        } | null
+   767→   767→        if (!res.ok || !data?.id) {
+   768→   768→          throw Object.assign(new Error(data?.error ?? `No se pudo construir la app (error ${res.status}).`), {
+   769→   769→            errorType: data?.errorType,
+   770→   770→          })
+   771→   771→        }
+   772→   772→        const newContent = oeProjectContent(prefix, data, isWeb)
+   773→   773→        setMessages((prev) =>
+   774→   774→          prev.map((m) =>
+   775→   775→            m.id === assistantId
+   776→   776→              ? {
+   777→   777→                  ...m,
+   778→   778→                  content: newContent,
+   779→   779→                  fullContent: newContent,
+   780→   780→                  pendingProject: false,
+   781→   781→                  complete: true,
+   782→   782→                  meta: { ...m.meta, latencyMs: data.latencyMs ?? m.meta?.latencyMs ?? null },
+   783→   783→                }
+   784→   784→              : m,
+   785→   785→          ),
+   786→   786→        )
+   787→   787→        // Persistir el mensaje actualizado (directiva → tarjetas) para el historial.
+   788→   788→        void fetch('/api/chat/messages', {
+   789→   789→          method: 'PATCH',
+   790→   790→          headers: { 'Content-Type': 'application/json' },
+   791→   791→          body: JSON.stringify({ id: serverMessageId, content: newContent }),
+   792→   792→        }).catch(() => undefined)
+   793→   793→        lastBuildRef.current = {
+   794→   794→          projectId: data.id,
+   795→   795→          title: data.title ?? 'App construida',
+   796→   796→          files: (data.files ?? []).map((f) => f.path).slice(0, 12),
+   797→   797→          kind: isWeb ? 'web' : 'app',
+   798→   798→        }
+   799→   799→        void refreshQuota()
+   800→   800→        void refreshConversations()
+   801→
+   802→[showing lines 1-800 of 1599; use offset=801 with limit to continue reading]

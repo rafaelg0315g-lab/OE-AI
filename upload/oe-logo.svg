@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="oe-plate" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#12151A"/>
+      <stop offset="1" stop-color="#070809"/>
+    </linearGradient>
+    <linearGradient id="oe-titanium" x1="12" y1="12" x2="52" y2="52" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E9EDF2"/>
+      <stop offset="0.45" stop-color="#B9C0C9"/>
+      <stop offset="1" stop-color="#858B95"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#oe-plate)"/>
+  <rect x="0.5" y="0.5" width="63" height="63" rx="13.5" stroke="#262B31"/>
+  <circle cx="23" cy="32" r="12.5" stroke="url(#oe-titanium)" stroke-width="4"/>
+  <path d="M43.5 22.5h12M43.5 32h8.5M43.5 41.5h12" stroke="url(#oe-titanium)" stroke-width="4" stroke-linecap="round"/>
+</svg>

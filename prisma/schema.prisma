@@ -1,0 +1,295 @@
+// OE AI — esquema de datos
+// - ChatSession / ChatMessage: persistencia de conversaciones con el identificador
+//   del modelo utilizado (sin contenido en logs técnicos).
+// - UsageRecord: métricas de consumo (metadatos, nunca contenido de prompts/respuestas).
+// - ProviderCheck: resultados de comprobaciones reales de conectividad por proveedor/modelo.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  // PostgreSQL (Supabase) — elegido para que la MISMA base funcione en el
+  // sandbox y en producción (Vercel). Vercel serverless solo tiene IPv4:
+  // se usa el POOLER de sesión de Supabase (aws-0-us-east-1.pooler.supabase.com:5432),
+  // no el host directo db.<ref>.supabase.co:5432 (IPv6-only).
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model ChatSession {
+  id        String        @id // uuid generado en cliente
+  // PRIVACIDAD: supabaseId del propietario (verificado por token en servidor).
+  // Los chats de usuarios verificados solo los lee su dueño. null = sesión
+  // efímera/legado (invitados demo: chat sin historial en la interfaz).
+  ownerKey  String?
+  title     String        @default("Nueva conversación")
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  messages  ChatMessage[]
+
+  @@index([ownerKey, updatedAt])
+}
+
+model ChatMessage {
+  id                    String      @id @default(cuid())
+  sessionId             String
+  session               ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  role                  String // "user" | "assistant"
+  content               String
+  // Tipo de mensaje: "text" (texto/markdown) | "image" (imagen generada)
+  kind                  String      @default("text")
+  // Para kind="image": identificador del activo generado (servido por /api/assets/[id])
+  assetId               String?
+  // Imagen adjunta por el usuario en un mensaje de texto (visión: /api/assets/[id])
+  attachmentAssetId     String?
+  // Bloques estructurados del turno (JSON array de ChatBlock: genui/image/document/file/error)
+  blocksJson            String?
+  // Fuentes web usadas (JSON: [{name,url,hostName,snippet,date}]) cuando hubo búsqueda web
+  sourcesJson           String?
+  // Trazabilidad de enrutamiento (sin contenido sensible)
+  requestedModelId      String? // lo que pidió el usuario (o "auto")
+  resolvedModelId       String? // entrada de ruta usada (catálogo o virtual)
+  providerId            String? // proveedor empleado
+  providerReportedModel String? // modelo informado por el proveedor en la respuesta
+  status                String      @default("ok") // "ok" | "error"
+  errorType             String? // tipo de error, sin datos del proveedor sensibles
+  latencyMs             Int?
+  fallbackUsed          Boolean     @default(false)
+  createdAt             DateTime    @default(now())
+
+  @@index([sessionId, createdAt])
+}
+
+// Activos generados por herramientas (imágenes): binarios servidos vía /api/assets/[id].
+model GeneratedAsset {
+  id        String   @id @default(cuid())
+  sessionId String? // conversación asociada (opcional)
+  prompt    String // descripción usada para generar el activo
+  size      String // dimensiones solicitadas (p. ej. 1024x1024)
+  mime      String // tipo MIME (image/png)
+  data      Bytes // contenido binario
+  createdAt DateTime @default(now())
+
+  @@index([sessionId, createdAt])
+}
+
+model UsageRecord {
+  id                    String   @id @default(cuid())
+  requestId             String // identificador de solicitud para soporte
+  source                String // "chat" | "api_v1" | "health_check"
+  providerId            String?
+  requestedModelId      String?
+  resolvedModelId       String?
+  providerReportedModel String?
+  task                  String? // categoría de tarea del enrutador
+  status                String // "ok" | "error"
+  errorType             String?
+  latencyMs             Int?
+  promptChars           Int?
+  completionChars       Int?
+  fallbackUsed          Boolean  @default(false)
+  createdAt             DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([providerId, status])
+}
+
+model ProviderCheck {
+  id           String   @id @default(cuid())
+  providerId   String
+  modelId      String? // null = prueba del modelo predeterminado del proveedor
+  status       String // "ok" | "error" | "not_verifiable"
+  latencyMs    Int?
+  note         String? // nota técnica honesta (p.ej. adaptador sin selección de modelo)
+  reportedBy   String? // "real_test" | "config"
+  checkedAt    DateTime @default(now())
+
+  @@index([providerId, checkedAt])
+}
+
+// ── Constructor de apps en el chat (sucesor del Modo Agente) ────────────────
+// BuildProject: una app generada desde la conversación principal. El asistente
+// emite una directiva ```oe-build y el constructor produce archivos completos
+// descargables (uno a uno o como .zip). Sin servidores ni workspaces: solo
+// archivos reales persistidos en DB.
+model BuildProject {
+  id          String   @id // uuid generado en cliente
+  sessionId   String? // conversación principal que lo originó
+  title       String   @default("Nueva app")
+  prompt      String // petición del usuario (brief)
+  mode        String   @default("fullstack") // fullstack | frontend | web
+  // building | ready | error
+  status      String   @default("building")
+  stack       String   @default("HTML · CSS · JS · Node.js")
+  planJson    String? // plan del constructor (JSON)
+  summaryNote String? // resumen final de la construcción
+  errorType   String?
+  // OE AI Web Factory (sitios web profesionales multi-página)
+  designJson     String? // sistema de diseño: paleta, tipografía, motion
+  provenanceJson String? // procedencia y licencias de los recursos usados
+  checksJson     String? // resultados de la validación automática
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  files BuildFile[]
+
+  @@index([sessionId, updatedAt])
+}
+
+// Archivos generados (contenido íntegro; servidos para descarga individual y .zip).
+model BuildFile {
+  id        String       @id @default(cuid())
+  projectId String
+  project   BuildProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  path      String // ruta relativa (p. ej. index.html, server.js)
+  content   String
+  language  String // html | css | js | json | md | text
+  bytes     Int          @default(0)
+  updatedAt DateTime     @updatedAt
+
+  @@unique([projectId, path])
+  @@index([projectId])
+}
+
+// ── OE AI Web Factory ──────────────────────────────────────────────
+// Catálogo de plantillas de referencia (GitHub topics / curadas). Cada entrada
+// registra procedencia, licencia verificada y estado para reutilización
+// responsable: "activo" = reusable según licencia; "referencia" = solo
+// inspiración visual (sin copiar código).
+model WebTemplate {
+  id              String   @id @default(cuid())
+  source          String // github-topic | github-curated | hyperui
+  name            String
+  repoUrl         String   @unique
+  category        String // landing | saas | agencia | portfolio | ecommerce | ...
+  tech            String   @default("HTML · CSS")
+  description     String   @default("")
+  licenseSpdx     String? // MIT | Apache-2.0 | CC-BY-3.0 | null = sin licencia clara
+  licenseVerified Boolean  @default(false) // true solo si la API devolvió spdx
+  stars           Int      @default(0)
+  tags            String? // JSON array de etiquetas
+  installNotes    String?
+  notes           String?
+  status          String   @default("activo") // activo | referencia
+  lastReviewedAt  DateTime @default(now())
+
+  @@index([category])
+  @@index([source])
+}
+
+// Componentes/secciones reutilizables (nivel B de la biblioteca).
+model WebComponent {
+  id              String   @id @default(cuid())
+  source          String // hyperui | curated
+  name            String
+  category        String // hero | nav | pricing | testimonios | cta | footer | faq | features | galeria | form | stats | logos | team | blog
+  tech            String   @default("HTML · Tailwind")
+  description     String   @default("")
+  licenseSpdx     String?
+  licenseVerified Boolean  @default(false)
+  repoUrl         String?
+  tags            String?
+  lastReviewedAt  DateTime @default(now())
+
+  @@unique([source, name])
+  @@index([category])
+}
+
+// ── Documentos (Writing Blocks / Canvas) ─────────────────────────────────────
+// Documento independiente del historial del chat: el contenido NO se reenvía
+// completo al modelo en cada turno (solo referencias + sección relevante).
+model Document {
+  id        String   @id @default(cuid())
+  sessionId String? // conversación propietaria (opcional)
+  title     String
+  kind      String   @default("writing") // writing | code | content | table
+  format    String   @default("markdown") // markdown | text | code
+  language  String? // para kind="code" (p. ej. tsx, python)
+  content   String
+  version   Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  versions DocumentVersion[]
+
+  @@index([sessionId, updatedAt])
+}
+
+// Historial de versiones por documento (restaurable desde Canvas).
+model DocumentVersion {
+  id         String   @id @default(cuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  content    String
+  note       String? // resumen del cambio que produjo la versión
+  version    Int
+  createdAt  DateTime @default(now())
+
+  @@index([documentId, version])
+}
+
+// Archivos reales generados para descarga (txt/md/csv/json/pdf); binario en DB.
+model GeneratedFile {
+  id        String   @id @default(cuid())
+  sessionId String?
+  name      String // nombre con extensión (informe.pdf)
+  format    String // txt | md | csv | json | pdf
+  mime      String
+  size      Int
+  data      Bytes
+  createdAt DateTime @default(now())
+
+  @@index([sessionId, createdAt])
+}
+
+// ── Autenticación (Supabase Auth · Google) ───────────────────────────────────
+// Perfil del usuario logueado con Google vía Supabase. El servidor NO confía
+// en los datos enviados por el cliente: valida el access token contra
+// Supabase (GET /auth/v1/user) y guarda la identidad verificada.
+model SupabaseUser {
+  id          String   @id @default(cuid())
+  supabaseId  String   @unique // id del usuario en Supabase Auth (uuid)
+  email       String   @unique
+  name        String?
+  avatarUrl   String?
+  lastLoginAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// Cuota de uso anónimo: cada sesión de invitado (cookie oe_guest de navegador)
+// dispone de N chats gratis antes de exigir inicio de sesión (Google o GitHub).
+// Una cookie de sesión (sin Max-Age) expira al cerrar el navegador: cada nuevo
+// inicio de sesión del navegador vuelve a disponer de su cuota completa.
+model GuestUsage {
+  guestId   String   @id // uuid de la cookie oe_guest
+  chatCount Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Memoria personalizada: datos breves que el usuario pide recordar y que se
+// inyectan en el prompt de sistema del chat. El propietario es la identidad
+// resuelta en servidor: id de Supabase (usuario verificado) o la cookie de
+// invitado oe_guest (misma identidad que la cuota de chats gratis).
+model ChatMemory {
+  id        String   @id @default(cuid())
+  ownerKey  String // id del usuario autenticado (supabaseId) o id de invitado (cookie oe_guest)
+  fact      String // dato a recordar (≤300 caracteres, validado en la API)
+  createdAt DateTime @default(now())
+
+  @@index([ownerKey])
+}
+
+// Enlaces públicos de lectura para compartir una conversación: el token es la
+// única credencial (32 hex); no expone identidad del propietario ni metadatos
+// de enrutamiento, solo el contenido de los mensajes.
+model ShareLink {
+  id        String   @id @default(cuid())
+  token     String   @unique // 32 hex (crypto.randomBytes(16))
+  sessionId String // conversación compartida (uuid generado en cliente)
+  createdAt DateTime @default(now())
+
+  @@index([sessionId])
+}
