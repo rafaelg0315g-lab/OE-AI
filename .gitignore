@@ -61,3 +61,5 @@ db/*.sqlite3
 
 # artifacts de sesión (no al repo)
 tool-results/
+# ...pero la plantilla de variables SÍ va al repo
+!.env.example
