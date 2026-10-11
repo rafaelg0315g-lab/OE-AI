@@ -13,7 +13,7 @@ const SUPPORTED_SIZES = ['1024x1024', '768x1344', '864x1152', '1344x768', '1152x
 
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024 // 6 MB tras decodificar
 
-// sniffImageMime se importa de '@/lib/ai/gemini-direct' (detección por magic bytes).
+// Nota: sniffImageMime vive en '@/lib/ai/gemini-direct' (magic bytes). NO redefinir aquí: rompe `next build`.
 
 const ImageEditBodySchema = z.object({
   // Data URL de la imagen a editar (PNG/JPEG/WebP, ≤6 MB decodificados).
