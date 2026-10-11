@@ -558,6 +558,7 @@ Work Log:
 - Commit local 9d6734c "fix(build): eliminar definicion duplicada de sniffImageMime (rompia next build en Vercel)". Push a GitHub FALLÓ: sin credenciales en esta sesión (el token compartido en un chat anterior ya no está disponible tras el resumen de contexto y fue redactado del worklog por seguridad).
 
 Stage Summary:
-- Build de Vercel desbloqueado en el sandbox: commit 9d6734c listo para pushear. Bloqueo externo: hace falta el token de GitHub (pegarlo de nuevo en chat) o push manual del usuario.
+- RESUELTO: push completado con token aportado por el usuario → remote main en 648bb00 (9d6734c fix + 648bb00 worklog auto-commit, escaneado sin secretos). Vercel re-despliega automáticamente.
+- Build de Vercel desbloqueado: commit 9d6734c ya en GitHub.
 - El resto del deploy ya estaba preparado por tareas previas: Postgres Supabase migrado, cascadas z-ai→Gemini→OpenRouter/Pollinations, DEPLOY_VERCEL.md + .env.example completos.
-- Pendiente usuario: (1) push de 9d6734c a GitHub, (2) env vars de .env.example en Vercel (§5 de DEPLOY_VERCEL.md), (3) añadir https://<dominio-vercel> a Site URL + Redirect URLs de Supabase Auth (§6).
+- Pendiente usuario: (1) env vars de .env.example en Vercel (§5 de DEPLOY_VERCEL.md), (2) añadir https://<dominio-vercel> a Site URL + Redirect URLs de Supabase Auth (§6), (3) rotar el token de GitHub pegado en chat.
