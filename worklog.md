@@ -562,3 +562,17 @@ Stage Summary:
 - Build de Vercel desbloqueado: commit 9d6734c ya en GitHub.
 - El resto del deploy ya estaba preparado por tareas previas: Postgres Supabase migrado, cascadas z-ai→Gemini→OpenRouter/Pollinations, DEPLOY_VERCEL.md + .env.example completos.
 - Pendiente usuario: (1) env vars de .env.example en Vercel (§5 de DEPLOY_VERCEL.md), (2) añadir https://<dominio-vercel> a Site URL + Redirect URLs de Supabase Auth (§6), (3) rotar el token de GitHub pegado en chat.
+
+---
+Task ID: 28
+Agent: Z.ai Code (principal)
+Task: Diagnóstico deploy Vercel post-build (fase "Deploying outputs")
+
+Work Log:
+- Build de Vercel PASÓ (42s, todas las rutas compiladas incluida /c/[id]) tras los commits 9d6734c/f04be90/138bd65. El error original de sniffImageMime está muerto.
+- El usuario reporta que el deployment aún marca "Error" aunque el build completó. El fallo ocurre tras "Deploying outputs..." (19:19:07) o es confusión con el deployment viejo.
+- Verificado: dependencias normales (sin puppeteer/playwright; Prisma ~60MB < 250MB límite), repo limpio (una sola copia del route, 0 duplicados, solo rama main), historial GitHub íntegro commit a commit.
+- Pendiente: pedir al usuario las ~20 líneas del log DESPUÉS de "Deploying outputs..." y el estado del deployment más nuevo (Ready/Error + commit).
+
+Stage Summary:
+- Compilación resuelta. Falta identificar el error de la fase de despliegue (texto exacto tras "Deploying outputs...") o confirmar que el deployment nuevo ya está Ready y el usuario miraba el viejo.
