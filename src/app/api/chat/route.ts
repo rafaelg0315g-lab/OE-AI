@@ -16,9 +16,14 @@ import {
   createGeminiDirectMiniAdapter,
   geminiSearchWeb,
 } from '@/lib/ai/gemini-direct'
+import { detectMediaIntent } from '@/lib/ai/image-intent'
+import { generateImageWithCascade } from '@/lib/ai/image-cascade'
+import { generateSvgCode } from '@/lib/ai/svg-generator'
 
 export const dynamic = 'force-dynamic'
-export const maxDuration = 60
+// Los turnos de medios (imagen/SVG detectados en lenguaje natural) pueden tardar
+// más que un turno de texto: el techo de Vercel Hobby es 300 s.
+export const maxDuration = 300
 
 const ChatBodySchema = z.object({
   sessionId: z.string().uuid(),
@@ -275,6 +280,207 @@ export async function POST(request: Request) {
     // Fallo de infraestructura propia: se permite el turno (no se castiga al usuario).
   }
 
+  // 4b-bis) TURNO DE MEDIOS: el usuario pidió una imagen/icono/SVG en lenguaje
+  // natural ("crea una imagen de…", "genera un icono SVG de…"). La intención se
+  // detecta sin botones; el turno lo ejecuta la herramienta de medios del núcleo
+  // (la cuota de invitado ya se consumió arriba: 1 turno = 1 uso) y responde por
+  // SSE con eventos dedicados. No aplica si hay adjunto de visión, modo voz,
+  // intérprete, contexto de constructor o documento leído (esos turnos son chat).
+  const mediaIntent =
+    !attachment && !body.voice && body.translatorTarget === '' && !body.buildContext && !body.docContext
+      ? detectMediaIntent(body.message)
+      : null
+
+  if (mediaIntent) {
+    const isSvg = mediaIntent.format === 'svg'
+    const toolName = isSvg ? 'tool:svg' : 'tool:image'
+    await db.chatSession.upsert({
+      where: { id: body.sessionId },
+      create: {
+        id: body.sessionId,
+        title: body.message.slice(0, 60),
+        ...(identity?.kind === 'user' ? { ownerKey: identity.supabaseId } : {}),
+      },
+      update: {
+        updatedAt: new Date(),
+        ...(identity?.kind === 'user' && adoptOwnerlessSession ? { ownerKey: identity.supabaseId } : {}),
+      },
+    })
+    await db.chatMessage.create({
+      data: { sessionId: body.sessionId, role: 'user', content: body.message, requestedModelId: toolName, status: 'ok' },
+    })
+
+    const encoder = new TextEncoder()
+    const startedAt = Date.now()
+    const mediaStream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const send = (event: string, data: unknown) => {
+          try {
+            controller.enqueue(encoder.encode(sseChunk(event, data)))
+          } catch {
+            // cliente desconectado
+          }
+        }
+
+        send('meta', {
+          requestId,
+          providerId: isSvg ? 'tool-svg' : 'tool-image',
+          providerLabel: isSvg ? 'OE Media · Diseño SVG' : 'OE Media · Imagen',
+          routeKey: toolName,
+          catalogModelId: null,
+          routeLabel: isSvg ? 'Diseño vectorial SVG' : 'Generación de imagen',
+          routeNote: isSvg
+            ? 'Pediste SVG: se diseña código vectorial real que puedes descargar y escalar sin límite.'
+            : mediaIntent.format === 'icon'
+              ? 'Detecté un icono: lo genero como PNG con estilo de icono (es lo ideal para iconos).'
+              : 'Detecté una petición de imagen: la genero con el núcleo de medios.',
+          fallbackUsed: false,
+          streaming: false,
+          sessionId: body.sessionId,
+          sessionTitle: body.message.slice(0, 60),
+          mode: body.mode,
+          webSearch: false,
+          vision: false,
+          // Contrato del turno de medios: el cliente transforma el marcador en
+          // tarjeta de imagen (image) o deja fluir el texto (svg).
+          turn: isSvg ? 'svg' : 'image',
+          mediaFormat: mediaIntent.format,
+          coreLabel: 'OE Media',
+        })
+
+        try {
+          if (isSvg) {
+            send('stage', { stage: 'svg_design' })
+            const svg = await generateSvgCode(mediaIntent.prompt)
+            const content = `:::svg\n${svg.code}\n:::`
+            const assistant = await db.chatMessage.create({
+              data: {
+                sessionId: body.sessionId,
+                role: 'assistant',
+                content,
+                requestedModelId: toolName,
+                resolvedModelId: 'tool:svg',
+                providerId: svg.providerId,
+                providerReportedModel: svg.providerReportedModel,
+                status: 'ok',
+                latencyMs: svg.latencyMs,
+              },
+            })
+            await recordUsage({
+              requestId,
+              source: 'tool_svg',
+              providerId: svg.providerId,
+              requestedModelId: 'tool:svg',
+              resolvedModelId: svg.providerReportedModel ?? 'svg',
+              status: 'ok',
+              latencyMs: svg.latencyMs,
+              promptChars: mediaIntent.prompt.length,
+              completionChars: svg.code.length,
+            })
+            send('delta', { text: content })
+            send('done', {
+              messageId: assistant.id,
+              latencyMs: svg.latencyMs,
+              providerReportedModel: svg.providerReportedModel,
+              providerId: svg.providerId,
+              fallbackUsed: false,
+              webSearchUsed: false,
+              visionUsed: false,
+              docRead: false,
+            })
+          } else {
+            send('stage', { stage: 'image' })
+            const outcome = await generateImageWithCascade({ prompt: mediaIntent.prompt, size: mediaIntent.size })
+            const asset = await db.generatedAsset.create({
+              data: {
+                sessionId: body.sessionId,
+                prompt: mediaIntent.subject,
+                size: mediaIntent.size,
+                mime: outcome.mime,
+                data: outcome.buffer,
+              },
+            })
+            const latencyMs = Date.now() - startedAt
+            const message = await db.chatMessage.create({
+              data: {
+                sessionId: body.sessionId,
+                role: 'assistant',
+                content: mediaIntent.subject,
+                kind: 'image',
+                assetId: asset.id,
+                requestedModelId: toolName,
+                resolvedModelId: 'tool:image',
+                providerId: outcome.providerId,
+                providerReportedModel: outcome.reportedModel,
+                status: 'ok',
+                latencyMs,
+              },
+            })
+            await recordUsage({
+              requestId,
+              source: 'tool_image',
+              providerId: outcome.providerId,
+              requestedModelId: 'image-generation',
+              resolvedModelId: outcome.reportedModel,
+              status: 'ok',
+              latencyMs,
+              promptChars: mediaIntent.prompt.length,
+            })
+            send('image', {
+              url: `/api/assets/${asset.id}`,
+              assetId: asset.id,
+              prompt: mediaIntent.subject,
+              size: mediaIntent.size,
+              format: mediaIntent.format,
+              latencyMs,
+            })
+            send('done', {
+              messageId: message.id,
+              latencyMs,
+              providerReportedModel: outcome.reportedModel,
+              providerId: outcome.providerId,
+              fallbackUsed: false,
+              webSearchUsed: false,
+              visionUsed: false,
+              docRead: false,
+            })
+          }
+        } catch (err) {
+          console.error('[api/chat] error en turno de medios:', err instanceof Error ? err.message : err)
+          await recordUsage({
+            requestId,
+            source: isSvg ? 'tool_svg' : 'tool_image',
+            providerId: 'cascade',
+            requestedModelId: toolName,
+            status: 'error',
+            errorType: isSvg ? 'svg_generation_error' : 'image_generation_error',
+            latencyMs: Date.now() - startedAt,
+          })
+          send('error', {
+            message: isSvg
+              ? 'No pude diseñar el SVG en este momento. Inténtalo de nuevo o pídemelo como imagen PNG.'
+              : 'No pude generar la imagen: los proveedores de imagen no respondieron. Inténtalo de nuevo en unos segundos.',
+            errorType: isSvg ? 'svg_generation_error' : 'image_generation_error',
+            requestId,
+          })
+        } finally {
+          controller.close()
+        }
+      },
+    })
+
+    return new Response(mediaStream, {
+      headers: {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+        'X-Request-Id': requestId,
+        ...(guestSetCookie ? { 'Set-Cookie': guestSetCookie } : {}),
+      },
+    })
+  }
+
   // 4c) Memoria personalizada: los 12 datos más recientes del ownerKey se
   // inyectan como prefijo del prompt de sistema (fallo = continuar sin memoria).
   let memoryFacts: string[] = []
@@ -360,10 +566,15 @@ export async function POST(request: Request) {
   // idioma del usuario y la interpretación natural de lo que escribe.
   const LANGUAGE_RULE =
     ' Responde SIEMPRE en el idioma en el que escribe el usuario (por defecto, español). Si escribe con errores de tipeo o abreviaturas (p. ej. "hoa"), interpreta la intención obvia y responde con naturalidad, sin pedir aclaraciones innecesarias ni analizar el error.'
+  // Formato rico (interfaz estilo GPT): tarjetas con icono para secciones/planes.
+  const RICH_FORMAT_RULE =
+    '\n\nFORMATO RICO: cuando la respuesta tenga varias secciones paralelas (planes por fases, auditorías, categorías, comparativas, listas de características), usa bloques de tarjetas con esta sintaxis EXACTA:\n:::cards\n- zap | Título corto | Descripción de una o dos frases.\n- mic | Otro título | Otra descripción.\n:::\nEl icono (antes del primer |) debe ser UNA de estas palabras: zap, mic, eye, shield, database, cpu, globe, image, code, rocket, settings, users, lock, brain, sparkles, wrench, cloud, phone, mail, clock, check, book, search, bot, palette, video, music, folder, key, server, layers, box, star, heart, flag, compass, camera, terminal, bug, package, credit-card, trending-up, target, award, briefcase, building, home, leaf, sun, moon, flame, link, map, gift, wifi, activity, dollar, message, play, file, calendar, cart, truck, headphones, gamepad, plane, car, graduation, pulse, scale, lightbulb.\nUsa como máximo UN bloque por respuesta, con 2-6 tarjetas; el resto del texto en markdown normal. No uses :::cards si la respuesta es corta o conversacional.'
   const baseSystem =
-    body.mode === 'reflective'
-      ? 'Eres OE AI LLM, el modelo unificado de OE BUSINESS. Responde con razonamiento paso a paso, cuidadoso y bien estructurado, usando markdown cuando ayude a la claridad.' + LANGUAGE_RULE
-      : 'Eres OE AI LLM, el modelo unificado de OE BUSINESS. Responde de forma directa, clara y útil, usando markdown cuando ayude a la claridad.' + LANGUAGE_RULE
+    (body.mode === 'reflective'
+      ? 'Eres OE AI LLM, el modelo unificado de OE BUSINESS. Responde con razonamiento paso a paso, cuidadoso y bien estructurado, usando markdown cuando ayude a la claridad.'
+      : 'Eres OE AI LLM, el modelo unificado de OE BUSINESS. Responde de forma directa, clara y útil, usando markdown cuando ayude a la claridad.') +
+    LANGUAGE_RULE +
+    RICH_FORMAT_RULE
   const systemMessages: ChatRequestMessage[] = []
   if (body.translatorTarget) {
     const langName = TRANSLATOR_LANGUAGE_NAMES[body.translatorTarget]
@@ -409,7 +620,7 @@ export async function POST(request: Request) {
       systemMessages.push({
         role: 'system' as const,
         content:
-          'Estás en una conversación por VOZ en tiempo real. Responde SIEMPRE en español, con un tono natural, cálido y conversacional. Sé breve: como máximo dos o tres frases cortas por respuesta. PROHIBIDO usar markdown, listas, emojis, enlaces, negritas ni bloques de código: tu texto se convierte directamente en voz sintética y debe sonar bien leído en voz alta.',
+          'Estás en una conversación por VOZ en tiempo real. Responde SIEMPRE en español, con un tono natural, cálido y conversacional. Sé breve: como máximo dos o tres frases cortas por respuesta. PROHIBIDO usar markdown, listas, emojis, enlaces, negritas ni bloques de código (tampoco bloques :::cards ni :::svg): tu texto se convierte directamente en voz sintética y debe sonar bien leído en voz alta.',
       })
     }
   }

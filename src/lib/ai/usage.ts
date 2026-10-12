@@ -12,6 +12,7 @@ export interface UsageInput {
     | 'api_v1'
     | 'health_check'
     | 'tool_image'
+    | 'tool_svg'
     | 'tool_image_edit'
     | 'tool_video'
     | 'tool_tts'

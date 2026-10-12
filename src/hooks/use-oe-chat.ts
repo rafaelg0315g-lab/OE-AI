@@ -1035,9 +1035,32 @@ export function useOeChat(options?: { initialChatId?: string }) {
 
       const handleEvent = (event: string, data: unknown) => {
         if (event === 'meta') {
-          const meta = data as { routeNote?: string; coreLabel?: string; mode?: 'instant' | 'reflective'; streaming?: boolean }
+          const meta = data as {
+            routeNote?: string
+            coreLabel?: string
+            mode?: 'instant' | 'reflective'
+            streaming?: boolean
+            turn?: 'text' | 'image' | 'svg'
+          }
           serverStreaming = Boolean(meta.streaming)
           if (meta.routeNote) setRouteNote(meta.routeNote)
+          if (meta.turn === 'image') {
+            // Turno de medios (imagen detectada en lenguaje natural): el marcador
+            // de texto se convierte en tarjeta de imagen con placeholder.
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId
+                  ? {
+                      ...m,
+                      kind: 'image',
+                      pendingImage: true,
+                      meta: { ...m.meta, coreLabel: meta.coreLabel ?? null, routeNote: meta.routeNote ?? null },
+                    }
+                  : m,
+              ),
+            )
+            return
+          }
           setMessages((prev) =>
             prev.map((m) =>
               m.id === assistantId
@@ -1081,6 +1104,25 @@ export function useOeChat(options?: { initialChatId?: string }) {
             )
             startTypewriter(assistantId, text)
           }
+        } else if (event === 'image') {
+          // Imagen generada dentro del turno de chat (intención detectada).
+          const d = data as { url?: string; prompt?: string; latencyMs?: number }
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...m,
+                    kind: 'image',
+                    pendingImage: false,
+                    complete: true,
+                    content: d.prompt ?? m.content,
+                    fullContent: d.prompt ?? m.fullContent,
+                    assetUrl: d.url ?? null,
+                    meta: { ...m.meta, latencyMs: d.latencyMs ?? null },
+                  }
+                : m,
+            ),
+          )
         } else if (event === 'done') {
           const d = data as {
             messageId?: string | null

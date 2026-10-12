@@ -3,7 +3,7 @@ import { db } from '@/lib/db'
 import { checkRateLimit, clientKeyFromHeaders } from '@/lib/ai/ratelimit'
 import { recordUsage } from '@/lib/ai/usage'
 import { consumeGuestChat, guestCookieHeader, resolveChatIdentity } from '@/lib/auth/guest'
-import { geminiImageGenerate, sniffImageMime } from '@/lib/ai/gemini-direct'
+import { generateImageWithCascade } from '@/lib/ai/image-cascade'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 120
@@ -89,103 +89,11 @@ export async function POST(request: Request) {
 
   const startedAt = Date.now()
 
-  // CASCADA de generación de imagen (política de despliegue): el primer
-  // generador es el núcleo del entorno (z-ai, disponible en el sandbox); el
-  // resto son respaldos para producción (p. ej. Vercel, donde el SDK del
-  // sandbox no tiene credenciales): Gemini directo → OpenRouter → Pollinations
-  // (gratuita y sin clave). Cada intento se registra; gana el primero que
-  // devuelva una imagen utilizable.
-  type ImageOutcome = { buffer: Buffer; mime: string; providerId: string; reportedModel: string }
-  const OR_IMAGE_MODELS = ['google/gemini-2.5-flash-image', 'google/gemini-3.1-flash-image', 'openai/gpt-5-image-mini']
-
-  const generators: Array<{ id: string; run: () => Promise<ImageOutcome> }> = [
-    {
-      id: 'zai-org',
-      run: async () => {
-        const { default: ZAI } = await import('z-ai-web-dev-sdk')
-        const zai = await ZAI.create()
-        const result = await zai.images.generations.create({ prompt, size: body.size })
-        const base64 = result?.data?.[0]?.base64
-        if (!base64) {
-          throw new Error('El proveedor de imágenes no devolvió datos utilizables.')
-        }
-        const buffer = Buffer.from(base64, 'base64')
-        return { buffer, mime: sniffImageMime(buffer), providerId: 'zai-org', reportedModel: 'image-generation' }
-      },
-    },
-    {
-      id: 'gemini-direct',
-      run: async () => {
-        const img = await geminiImageGenerate(prompt, body.size)
-        return { buffer: img.buffer, mime: sniffImageMime(img.buffer), providerId: 'gemini-direct', reportedModel: img.model }
-      },
-    },
-    {
-      id: 'openrouter',
-      run: async () => {
-        const key = process.env.OPENROUTER_API_KEY?.trim()
-        if (!key) throw new Error('OPENROUTER_API_KEY no configurada.')
-        let lastErr = 'sin intentos'
-        for (const model of OR_IMAGE_MODELS) {
-          const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model,
-              modalities: ['image', 'text'],
-              messages: [{ role: 'user', content: prompt.slice(0, 900) }],
-            }),
-            signal: AbortSignal.timeout(120_000),
-          })
-          const data = (await res.json().catch(() => null)) as {
-            error?: { message?: string }
-            choices?: Array<{ message?: { images?: Array<{ image_url?: { url?: string } }> } }>
-          } | null
-          const dataUrl = data?.choices?.[0]?.message?.images?.[0]?.image_url?.url
-          if (res.ok && dataUrl) {
-            const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1)
-            const buffer = Buffer.from(base64, 'base64')
-            if (buffer.byteLength) {
-              return { buffer, mime: sniffImageMime(buffer), providerId: 'openrouter', reportedModel: model }
-            }
-          }
-          lastErr = data?.error?.message?.slice(0, 140) || `HTTP ${res.status}`
-          // 402 (sin créditos) / 403 (geo): probar el siguiente modelo.
-        }
-        throw new Error(`OpenRouter sin imagen: ${lastErr}`)
-      },
-    },
-    {
-      id: 'pollinations',
-      run: async () => {
-        // Respaldo gratuito y sin clave (modelo flux). Sin soporte de edición;
-        // el tamaño es orientativo (el servicio decide el recorte final).
-        const [w, h] = body.size.split('x').map((n) => Number.parseInt(n, 10) || 1024)
-        const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt.slice(0, 900))}?width=${w}&height=${h}&nologo=true&model=flux`
-        const res = await fetch(url, { signal: AbortSignal.timeout(120_000) })
-        if (!res.ok) throw new Error(`Pollinations HTTP ${res.status}`)
-        const buffer = Buffer.from(await res.arrayBuffer())
-        if (!buffer.byteLength) throw new Error('Pollinations devolvió una imagen vacía.')
-        return { buffer, mime: sniffImageMime(buffer), providerId: 'pollinations', reportedModel: 'flux' }
-      },
-    },
-  ]
-
   try {
-    let outcome: ImageOutcome | null = null
-    let lastError: unknown = null
-    for (const generator of generators) {
-      try {
-        outcome = await generator.run()
-        if (generator.id !== 'zai-org') {
-          console.warn(`[api/tools/image] generada con respaldo ${generator.id}`)
-        }
-        break
-      } catch (genErr) {
-        lastError = genErr
-      }
-    }
-    if (!outcome) throw lastError instanceof Error ? lastError : new Error('Ningún proveedor de imágenes disponible.')
+    // CASCADA compartida (política de despliegue): núcleo z-ai (sandbox) →
+    // Gemini directo → OpenRouter → Pollinations (gratuita y sin clave).
+    // Gana el primero que devuelva una imagen utilizable.
+    const outcome = await generateImageWithCascade({ prompt, size: body.size })
 
     const asset = await db.generatedAsset.create({
       data: { sessionId: body.sessionId, prompt, size: body.size, mime: outcome.mime, data: outcome.buffer },
