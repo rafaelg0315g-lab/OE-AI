@@ -2,7 +2,7 @@
  * Configuración de OE AI LLM mediante variables de entorno.
  * Nunca contiene valores secretos: solo lee nombres de variables.
  */
-import type { ProductCategory } from './types'
+import { PRODUCT_CATEGORIES, type ProductCategory } from './types'
 
 /** Ruta de modelo de catálogo habilitada por administrador vía OE_AI_MODEL_ROUTES. */
 export interface EnabledModelRoute {
@@ -16,29 +16,40 @@ export interface EnabledModelRoute {
 function parseEnabledRoutes(raw: string | undefined): EnabledModelRoute[] {
   if (!raw) return []
   const out: EnabledModelRoute[] = []
+  // Categorías válidas para el sufijo opcional (IMPORTANTE: los IDs de modelo de
+  // OpenRouter terminan en ':free', que NO es una categoría y debe conservarse).
+  const knownTasks: readonly string[] = PRODUCT_CATEGORIES
   for (const part of raw.split(',')) {
     const trimmed = part.trim()
     if (!trimmed) continue
     // Formato: proveedor:modeloCatalogo[>idInternoProveedor][:categoria]
-    const segments = trimmed.split(':')
-    if (segments.length < 2) continue
-    const providerId = segments[0]
-    const modelId = segments[1]
+    // El ID del modelo puede contener ':' (p. ej. 'nvidia/nemotron-3.5-lightning:free'),
+    // así que el proveedor es todo lo anterior al PRIMER ':'. La categoría opcional
+    // solo se reconoce si el sufijo tras el último ':' coincide con una conocida.
+    const firstColon = trimmed.indexOf(':')
+    if (firstColon <= 0) continue
+    const providerId = trimmed.slice(0, firstColon).trim()
+    let rest = trimmed.slice(firstColon + 1).trim()
+    if (!providerId || !rest) continue
     let providerModelId: string | undefined
     let task: ProductCategory | undefined
-    if (segments.length >= 3) {
-      if (segments[2].includes('>')) {
-        const [inner, maybeTask] = segments[2].split('>')
-        providerModelId = inner || undefined
-        task = maybeTask as ProductCategory | undefined
-      } else {
-        task = segments[2] as ProductCategory | undefined
+    const lastColon = rest.lastIndexOf(':')
+    if (lastColon !== -1) {
+      const maybeTask = rest.slice(lastColon + 1).trim()
+      if (knownTasks.includes(maybeTask)) {
+        task = maybeTask as ProductCategory
+        rest = rest.slice(0, lastColon).trim()
       }
     }
-    if (!providerId || !modelId) continue
+    const gtIndex = rest.indexOf('>')
+    if (gtIndex !== -1) {
+      providerModelId = rest.slice(gtIndex + 1).trim() || undefined
+      rest = rest.slice(0, gtIndex).trim()
+    }
+    if (!rest) continue
     out.push({
       providerId,
-      modelId,
+      modelId: rest,
       providerModelId,
       task,
       routeKey() {
@@ -49,7 +60,7 @@ function parseEnabledRoutes(raw: string | undefined): EnabledModelRoute[] {
   return out
 }
 
-/** Rutas habilitadas: OE_AI_MODEL_ROUTES="groq:meta-llama/Llama-3.1-8B-Instruct, together:Qwen/Qwen3-32B" */
+/** Rutas habilitadas: OE_AI_MODEL_ROUTES="groq:meta-llama/Llama-3.1-8B-Instruct, openrouter:nvidia/nemotron-3.5-lightning:free" */
 export const ENABLED_MODEL_ROUTES: EnabledModelRoute[] = parseEnabledRoutes(
   process.env.OE_AI_MODEL_ROUTES,
 )
