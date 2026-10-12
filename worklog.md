@@ -591,3 +591,20 @@ Work Log:
 
 Stage Summary:
 - Último bloqueo de deploy eliminado. El video se cubre con 300s (render típico 30-150s).
+
+---
+Task ID: 30
+Agent: Z.ai Code (principal)
+Task: Recuperación de env vars y preparación final del deploy de Vercel
+
+Work Log:
+- Hallazgo crítico: el .env del sandbox fue borrado (limpieza del sandbox); el shell tenía DATABASE_URL=file:...sqlite heredado → P1012. Error 500 de /api/chat en Vercel = sin DATABASE_URL (la cuota "0 de 5" era el fallback silencioso del endpoint).
+- .env local restaurado con: GEMINI_API_KEY y JSON2VIDEO_API_KEY (recuperadas del contexto de conversación previa), DATABASE_URL y NEXT_PUBLIC_SUPABASE_ANON_KEY (aportadas por el usuario), GEMINI_BUILD_MODEL.
+- Password de BD verificada EN VIVO: 'Oskitar11..' (variante A) → prisma db execute SELECT 1 OK; la variante sin puntos falla (P1001). 5 tablas verificadas intactas en Supabase (GuestUsage, SupabaseUser, ChatSession, GeneratedAsset, BuildProject).
+- Supabase migró a nuevas keys: sb_publishable_... reemplaza a la anon JWT; el código lee NEXT_PUBLIC_SUPABASE_ANON_KEY → en Vercel el NOMBRE debe ser NEXT_PUBLIC_SUPABASE_ANON_KEY con el VALOR sb_publishable_40KP4Lt2bFtx5l2WUXQM1Q_E6p97X4W. La sb_secret NO hace falta (protegida/masquerada además).
+- OE_AI_MODEL_ROUTES: irrecuperable (no está en dump.pm2, bash history, ni APIs; /api/admin/overview protegido y no devuelve valores). No bloquea el chat: la cascada automática es independiente. Pendiente de reconstrucción opcional.
+- unset DATABASE_URL en el shell para futuros comandos prisma.
+
+Stage Summary:
+- Vercel solo necesita: DATABASE_URL (verificada), NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY (sb_publishable_...), GEMINI_API_KEY, JSON2VIDEO_API_KEY + OPENROUTER_API_KEY (pendiente del usuario) → Redeploy.
+- Pendiente: §6 Supabase redirect https://oe-ai.vercel.app/** para login; rotar password de BD y token de GitHub pegados en chat; reconstruir OE_AI_MODEL_ROUTES (opcional); OPENROUTER_API_KEY pendiente para .env local.
