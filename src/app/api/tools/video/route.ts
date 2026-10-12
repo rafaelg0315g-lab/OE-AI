@@ -6,7 +6,8 @@ import { consumeGuestChat, guestCookieHeader, resolveChatIdentity } from '@/lib/
 
 export const dynamic = 'force-dynamic'
 // El render con JSON2Video suele tardar 30-150 s; el sondeo deja margen amplio.
-export const maxDuration = 480
+// Tope 300 s: máximo permitido por el plan Hobby de Vercel (480 rompía el deploy).
+export const maxDuration = 300
 
 /** Tamaños soportados realmente por el proveedor de vídeo (incluye 1080p). */
 const SUPPORTED_SIZES = [
