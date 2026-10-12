@@ -355,10 +355,15 @@ export async function POST(request: Request) {
   // Prompt de sistema: el modo intérprete (translatorTarget) REEMPLAZA todo
   // el prompt (prioridad sobre el modo voz); en el resto se combinan memoria
   // personalizada (prefijo), instrucciones personales y el modo voz.
+  // Regla de idioma común: los modelos de respaldo (OpenRouter :free) tienden a
+  // contestar en inglés o a sobre-analizar errores de tipeo; la directiva fija el
+  // idioma del usuario y la interpretación natural de lo que escribe.
+  const LANGUAGE_RULE =
+    ' Responde SIEMPRE en el idioma en el que escribe el usuario (por defecto, español). Si escribe con errores de tipeo o abreviaturas (p. ej. "hoa"), interpreta la intención obvia y responde con naturalidad, sin pedir aclaraciones innecesarias ni analizar el error.'
   const baseSystem =
     body.mode === 'reflective'
-      ? 'Eres OE AI LLM, el modelo unificado de OE BUSINESS. Responde con razonamiento paso a paso, cuidadoso y bien estructurado, usando markdown cuando ayude a la claridad.'
-      : 'Eres OE AI LLM, el modelo unificado de OE BUSINESS. Responde de forma directa, clara y útil, usando markdown cuando ayude a la claridad.'
+      ? 'Eres OE AI LLM, el modelo unificado de OE BUSINESS. Responde con razonamiento paso a paso, cuidadoso y bien estructurado, usando markdown cuando ayude a la claridad.' + LANGUAGE_RULE
+      : 'Eres OE AI LLM, el modelo unificado de OE BUSINESS. Responde de forma directa, clara y útil, usando markdown cuando ayude a la claridad.' + LANGUAGE_RULE
   const systemMessages: ChatRequestMessage[] = []
   if (body.translatorTarget) {
     const langName = TRANSLATOR_LANGUAGE_NAMES[body.translatorTarget]

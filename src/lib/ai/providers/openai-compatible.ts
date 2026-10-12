@@ -108,6 +108,10 @@ export function createOpenAICompatibleAdapter(
             model: options.providerModelId,
             messages: options.messages,
             stream: false,
+            // OpenRouter: excluye el razonamiento de los modelos reasoning
+            // (nemotron…): evita que el 'thinking' se cuele en el contenido.
+            // Los demás proveedores no reciben este campo (podrían rechazarlo).
+            ...(def.id === 'openrouter' ? { reasoning: { exclude: true } } : {}),
           }),
           signal: options.signal,
           cache: 'no-store',
@@ -170,6 +174,8 @@ export function createOpenAICompatibleAdapter(
                   model: options.providerModelId,
                   messages: options.messages,
                   stream: true,
+                  // Mismo motivo que en chat() (solo OpenRouter).
+                  ...(def.id === 'openrouter' ? { reasoning: { exclude: true } } : {}),
                 }),
                 signal: options.signal,
                 cache: 'no-store',
