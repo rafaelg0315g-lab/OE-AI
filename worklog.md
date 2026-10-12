@@ -608,3 +608,21 @@ Work Log:
 Stage Summary:
 - Vercel solo necesita: DATABASE_URL (verificada), NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY (sb_publishable_...), GEMINI_API_KEY, JSON2VIDEO_API_KEY + OPENROUTER_API_KEY (pendiente del usuario) → Redeploy.
 - Pendiente: §6 Supabase redirect https://oe-ai.vercel.app/** para login; rotar password de BD y token de GitHub pegados en chat; reconstruir OE_AI_MODEL_ROUTES (opcional); OPENROUTER_API_KEY pendiente para .env local.
+
+---
+Task ID: 30
+Agent: main (Z.ai Code)
+Task: Restaurar .env local + identificar env vars faltantes en Vercel (causa del 500 en /api/chat)
+
+Work Log:
+- .env local reconstruido y COMPLETO (chmod 600): DATABASE_URL con password real, NEXT_PUBLIC_SUPABASE_ANON_KEY=sb_publishable_..., GEMINI_API_KEY, GEMINI_BUILD_MODEL, JSON2VIDEO_API_KEY
+- Verificado en vivo: `prisma db execute SELECT 1` OK contra aws-0-us-east-1.pooler.supabase.com:5432 (password Oskitar11.. válida, 5 tablas intactas)
+- Verificado en vivo: publishable key sb_publishable_40KP4... aceptada por Supabase Auth (400 invalid_credentials para usuario falso = key válida; key inválida daría 401)
+- Grep de process.env en src/: app usa DATABASE_URL, NEXT_PUBLIC_SUPABASE_URL/ANON_KEY, GEMINI_API_KEY, GEMINI_BUILD_MODEL, JSON2VIDEO_API_KEY, OPENROUTER_API_KEY, ELEVENLABS_API_KEY (+ opcionales GROQ/ADMIN/API_KEY)
+- Usuario mostró env vars de Vercel: tiene TODAS las SUPABASE_* y NEXT_PUBLIC_* pero FALTA DATABASE_URL (crítico) y las de IA (GEMINI_API_KEY, JSON2VIDEO_API_KEY, OPENROUTER_API_KEY)
+
+Stage Summary:
+- Diagnóstico confirmado: el 500 de /api/chat en producción = DATABASE_URL ausente en Vercel (primer touch de Prisma muere)
+- Instrucciones dadas al usuario: añadir DATABASE_URL + GEMINI_API_KEY + JSON2VIDEO_API_KEY (+ opcionales) en Vercel → Redeploy
+- .env local listo para que el sandbox funcione igual que producción
+- Pendiente: OPENROUTER_API_KEY del usuario (opcional, es fallback), rotación de credenciales expuestas en chat (GitHub token, DB password)
