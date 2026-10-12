@@ -668,3 +668,28 @@ Stage Summary:
 - La cascada local queda: z-ai → Gemini → OpenRouter (42 rutas, key real válida) → Pollinations.
 - OJO (patrón recurrente): el shell hereda DATABASE_URL=file:...sqlite; para scripts de BD siempre usar DATABASE_URL="$(rg '^DATABASE_URL=' .env | cut -d= -f2-)".
 - Si el .env vuelve a resetearse, reponer DATABASE_URL con el pooler de Supabase.
+---
+Task ID: 34
+Agent: Z.ai Code (main)
+Task: Chat más inteligente — intención de medios (imagen/icono/SVG natural) + respuestas ricas estilo GPT (:::cards, :::svg)
+
+Work Log:
+- Explorado el flujo completo: /api/chat (SSE meta→delta→done), use-oe-chat.ts (handleEvent), markdown.tsx (ReactMarkdown), tools/image (cascada inline), message-list (kind image/pendingImage).
+- NEW src/lib/ai/image-intent.ts: detectMediaIntent() — verbos de creación + objetos (imagen/icono/logo/svg…); formato: SVG solo explícito, icono→PNG estilo icono, resto imagen; limpia conectores y palabras de formato del sujeto; orientación (vertical manda sobre banner); ignora mensajes >240 chars o sin verbo (preguntas intactas).
+- NEW src/lib/ai/image-cascade.ts: generateImageWithCascade() compartida (z-ai→Gemini→OpenRouter→Pollinations) + sniffImageMime; tools/image refactorizado a esta lib.
+- NEW src/lib/ai/svg-generator.ts: generateSvgCode() con cascada de texto (z-ai→Gemini→OR), SVG_SYSTEM estricto, extractSvgCode() valida <svg>…</svg> + viewBox.
+- /api/chat: rama 4b-bis TURNO DE MEDIOS (tras cuota, antes de memoria): upsert sesión + persist user/assistant, SSE meta {turn:'image'|'svg', mediaFormat}, stage, evento image {url,assetId,prompt} o delta con bloque :::svg, done, error tipificado; maxDuration 300; RICH_FORMAT_RULE en baseSystem (sintaxis :::cards + lista de iconos + máx 1 bloque/2-6 tarjetas); modo voz prohíbe :::.
+- use-oe-chat.ts: handleEvent maneja meta.turn==='image' (placeholder→kind image pendingImage) y evento 'image' (assetUrl+complete).
+- markdown.tsx reescrito: splitRichSegments (vallas ``` prioridad, bloques :::cards/:::svg, streaming parcial, cierres truncados '::' descartados), CardGroup (chips lucide ~75 iconos + alias growth/money/team…, fallback Sparkles), SvgCard (preview por data URL en <img> — sin DOM crudo, descarga SVG + PNG 512 rasterizado en canvas, copiar), MarkdownSegment extraído intacto.
+- usage.ts: source 'tool_svg' añadido a la unión.
+- welcome-screen: chips nuevos "Genera una imagen" (lenguaje natural) y "Diseña un icono SVG".
+- Fixes durante verificación: Brain no importado (500 en /) → añadido; tipo size del SDK z-ai (unión literal); parseCards filtra títulos ':'/'::' (respuesta truncada de z-ai); 'banner vertical' → 768x1344 (vertical primero).
+- Verificado en navegador (agent-browser): tarjetas GPT renderizadas (Fase 1/2/3 con zap/mic/eye), turno SVG (cohete y casa con jardín) con botones PNG/SVG/Copiar sin errores de consola, turno de imagen con la frase EXACTA que fallaba al usuario ("crea una imagen de un zorro minimalista con figuras geométricas") → imagen generada y renderizada, móvil 390px correcto, chat invitado efímero intacto.
+- pm2: OJO — cada shell nuevo hereda DATABASE_URL=sqlite y pm2 restart --update-env lo inyecta; SIEMPRE exportar el pooler en el MISMO comando del restart.
+
+Stage Summary:
+- Chat con herramientas naturales: pedir imagen/icono/SVG en texto plano ejecuta el generador sin botones ni comandos; iconos=PNG por defecto, SVG solo explícito.
+- Respuestas estilo GPT: el núcleo emite :::cards con iconos (render premium con contenedor, chips y dividers) — probado en vivo con plan de 3 fases.
+- SVG real: código vectorial descargable (.svg/.png) generado por LLM con preview seguro.
+- Commit 3de1e3f pusheado a main (Vercel despliega solo); sin env vars nuevas necesarias.
+- Deuda conocida: tsc baseline 22 errores preexistentes (route completion-asignación, Buffer/Bytes, web-factory) — no introducidos por esta tarea.
