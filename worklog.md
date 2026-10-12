@@ -626,3 +626,24 @@ Stage Summary:
 - Instrucciones dadas al usuario: añadir DATABASE_URL + GEMINI_API_KEY + JSON2VIDEO_API_KEY (+ opcionales) en Vercel → Redeploy
 - .env local listo para que el sandbox funcione igual que producción
 - Pendiente: OPENROUTER_API_KEY del usuario (opcional, es fallback), rotación de credenciales expuestas en chat (GitHub token, DB password)
+
+---
+Task ID: 31
+Agent: main (Z.ai Code)
+Task: OpenRouter como fallback real en producción (key + rutas + fix de parser)
+
+Work Log:
+- Diagnóstico del error "El proveedor no pudo procesar la solicitud" (= zai.ts safe message): en Vercel el núcleo z-ai nunca puede funcionar (sin credenciales OE) y el mensaje surfaced prueba que runtimeFallbacks estaba VACÍO → GEMINI_API_KEY no presente/efectiva en Vercel
+- Pruebas en vivo con la key de Gemini: AUTENTICA OK, pero gemini-3.1-pro-preview → 429 free tier limit:0 (desde sandbox; puede variar desde Vercel US); gemini-3.8-flash → 403 "project denied"; 2.5/2.0 flash/pro → 404 deprecated para usuarios nuevos; listModels → geo-bloqueado desde sandbox
+- HALLAZGO CRÍTICO: el adaptador OpenAI-compatible solo expone rutas de OE_AI_MODEL_ROUTES (ENABLED_MODEL_ROUTES). Con la variable perdida, añadir OPENROUTER_API_KEY NO habría hecho nada (orRoutes.length===0 → fallback saltado en silencio)
+- SEGUNDO bug: el parser cortaba en cada ':' → 'modelo:free' perdía el sufijo (modelId sin :free + task basura 'free')
+- Fix config.ts parseEnabledRoutes: proveedor = antes del PRIMER ':'; categoría solo si sufijo final ∈ PRODUCT_CATEGORIES; '>' para ID interno admite ':'; retrocompatible. 5 casos probados en vivo (bun): :free conservado, formato viejo intacto, task e ID interno OK
+- Lista en vivo OpenRouter /models: 458 modelos, 15 gratis texto. Elegidos: nvidia/nemotron-3-super-120b-a12b:free + google/gemma-4-31b-it:free
+- .env local: OE_AI_MODEL_ROUTES añadida con esas 2 rutas; OPENROUTER_API_KEY sigue pendiente del usuario
+- bun run lint exit 0; commit 821dd3e; push a main OK (617b0d2..821dd3e)
+
+Stage Summary:
+- Para que el chat funcione en Vercel el usuario DEBE añadir 3-4 vars: DATABASE_URL (ya), GEMINI_API_KEY, OPENROUTER_API_KEY y OE_AI_MODEL_ROUTES=openrouter:nvidia/nemotron-3-super-120b-a12b:free, openrouter:google/gemma-4-31b-it:free → Redeploy
+- OpenRouter free tier: ~50 req/día con cuenta sin saldo (suficiente como red de seguridad del chat, no como primario ilimitado)
+- La ruta de imagen usa OR_IMAGE_MODELS hardcoded (no depende del parser); video = JSON2VIDEO_API_KEY (ya en .env, falta en Vercel)
+- Limitación conocida: sin billing en Google, Gemini puede seguir 429 (limit:0) desde Vercel; OpenRouter queda como vía real de chat
