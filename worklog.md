@@ -576,3 +576,18 @@ Work Log:
 
 Stage Summary:
 - Compilación resuelta. Falta identificar el error de la fase de despliegue (texto exacto tras "Deploying outputs...") o confirmar que el deployment nuevo ya está Ready y el usuario miraba el viejo.
+
+---
+Task ID: 29
+Agent: Z.ai Code (principal)
+Task: Fix "invalid maxDuration" en deploy Vercel
+
+Work Log:
+- Error exacto del usuario: 'Builder returned invalid maxDuration value for Serverless Function "api/tools/video". Serverless Functions must have a maxDuration between 1 and 300 for plan hobby.'
+- Causa: src/app/api/tools/video/route.ts tenía maxDuration=480 (>300 permitido en Hobby). Fallaba en la fase Deploying outputs, no en el build.
+- Fix: maxDuration 480→300 + comentario. Auditar el resto: chat 60, tts 60, asr 60, read-doc 60, image 120, image-edit 120, web-factory 300, build-app 300, v1 60 — todos ≤300 OK.
+- Presupuestos internos verificados: FALLBACK_BUDGET_MS=100s (impide fallback tardío), MAX_POLL_ATTEMPTS=70 (~7min) solo aplica al fallback z-ai que en Vercel muere al instante sin credenciales; JSON2Video primario rinde en 30-150s.
+- Commit pusheado a main. Pendiente: usuario confirma deployment Ready + checklist post-deploy (env vars §5, redirect Supabase §6).
+
+Stage Summary:
+- Último bloqueo de deploy eliminado. El video se cubre con 300s (render típico 30-150s).
