@@ -647,3 +647,24 @@ Stage Summary:
 - OpenRouter free tier: ~50 req/día con cuenta sin saldo (suficiente como red de seguridad del chat, no como primario ilimitado)
 - La ruta de imagen usa OR_IMAGE_MODELS hardcoded (no depende del parser); video = JSON2VIDEO_API_KEY (ya en .env, falta en Vercel)
 - Limitación conocida: sin billing en Google, Gemini puede seguir 429 (limit:0) desde Vercel; OpenRouter queda como vía real de chat
+---
+Task ID: 33
+Agent: Z.ai Code (main)
+Task: Arreglar "Error 500 al iniciar la conversación" (chat muerto) + restaurar PM2
+
+Work Log:
+- pm2 ls: los 3 procesos (oe-ai-dev :3000, oe-voice-ws :3010, oe-telegram-bot :3005) ya estaban online; el PM2 nunca llegó a perderse del todo.
+- dev.log mostró la causa real: PrismaClientInitializationError "the URL must start with the protocol postgresql:// or postgres://" en POST /api/chat y GET /api/chat/history.
+- Causa raíz: el .env se reseteó (sandbox restaurado) y DATABASE_URL volvió a file:./db/custom.db (SQLite) mientras schema.prisma usa provider postgresql.
+- Fix: sed en .env → DATABASE_URL=postgresql://postgres.xrtzzdfgyhfepqbaqskl:...@aws-0-us-east-1.pooler.supabase.com:5432/postgres (pooler, accesible desde Vercel).
+- Verificado con Prisma: conexión OK, 12 chatSessions (las 5 tablas de producción intactas).
+- Bonus: la OPENROUTER_API_KEY presente en el .env restaurado es REAL y válida (GET /api/v1/key → free tier, $0.015 usados).
+- pm2 restart oe-ai-dev --update-env exportando el DATABASE_URL correcto (el shell hereda el sqlite y lo pisa).
+- Prueba E2E con curl: POST /api/chat {message:"hola bro"} → stream SSE completo (meta zai-org → delta → done, 328ms). Sesión de prueba borrada de la BD.
+- dev.log confirma tráfico real del usuario con POST /api/chat 200.
+
+Stage Summary:
+- Chat local/previewer restaurado al 100%: 500 eliminado, z-ai (núcleo) responde y persiste en Supabase.
+- La cascada local queda: z-ai → Gemini → OpenRouter (42 rutas, key real válida) → Pollinations.
+- OJO (patrón recurrente): el shell hereda DATABASE_URL=file:...sqlite; para scripts de BD siempre usar DATABASE_URL="$(rg '^DATABASE_URL=' .env | cut -d= -f2-)".
+- Si el .env vuelve a resetearse, reponer DATABASE_URL con el pooler de Supabase.
