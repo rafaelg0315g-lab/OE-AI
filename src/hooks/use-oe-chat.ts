@@ -778,9 +778,11 @@ export function useOeChat(options?: { initialChatId?: string }) {
     if (focus && focus !== 'auto') setFocusModel(focus)
   }, [])
 
-  /** Revelación progresiva (máquina de escribir adaptativa, duración acotada).
-   *  Contenido estructurado (tablas/código): sin typewriter → render Markdown
-   *  inmediato y bien formateado (nunca se ve la sintaxis cruda). */
+  /** Revelación progresiva tipo CASCADA (efecto GPT/Claude): los caracteres
+   *  fluyen uno a uno a ritmo constante y legible (~90-180 c/s), con arranque
+   *  enérgico y aterrizaje suave. Contenido estructurado (tablas/código):
+   *  sin typewriter → render Markdown inmediato y bien formateado (nunca se
+   *  ve la sintaxis cruda). */
   const startTypewriter = useCallback((assistantId: string, full: string) => {
     if (/```|(^|\n)\s*\|/.test(full)) {
       setMessages((prev) =>
@@ -790,12 +792,16 @@ export function useOeChat(options?: { initialChatId?: string }) {
       return
     }
     setPhase('typing')
-    const duration = Math.min(2400, Math.max(700, full.length * 4))
+    const total = full.length
+    // Ritmo de cascada: 10 ms/char (≈100 c/s) con techo de 7 s para textos
+    // largos y suelo de 1.1 s para respuestas cortas.
+    const duration = Math.min(7000, Math.max(1100, total * 10))
     const start = performance.now()
     const step = (now: number) => {
       const p = Math.min(1, (now - start) / duration)
-      const eased = 1 - Math.pow(1 - p, 2.1)
-      const chars = Math.max(1, Math.floor(eased * full.length))
+      // Ease-out suave: empieza con impulso y desacelera al final (cascada).
+      const eased = 1 - Math.pow(1 - p, 1.55)
+      const chars = Math.max(1, Math.floor(eased * total))
       setMessages((prev) =>
         prev.map((m) => (m.id === assistantId ? { ...m, content: full.slice(0, chars) } : m)),
       )

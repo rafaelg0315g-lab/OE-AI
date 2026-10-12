@@ -311,6 +311,20 @@
   }
 }
 
+/* ---------- OE AI · tipografía distintiva del chat (estilo Claude) ---------- */
+/* Space Grotesk: titulares de bloques ricos (aire Styrene de Claude).        */
+.oe-display {
+  font-family: var(--font-oe-grotesk), ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: -0.01em;
+}
+/* Source Serif 4: prosa de las respuestas del asistente (aire Tiempos).      */
+.oe-serif-text {
+  font-family: var(--font-oe-serif), 'Iowan Old Style', Georgia, serif;
+  font-size: 15.5px;
+  line-height: 1.78;
+  letter-spacing: 0.002em;
+}
+
 /* ---------- OE AI · tablas markdown del chat (GFM) ---------- */
 .oe-md-table-wrap table {
   margin: 0;

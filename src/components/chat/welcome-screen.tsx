@@ -5,7 +5,7 @@
  * composer centrado y chips de sugerencia en carrusel (marquee, una fila).
  */
 import { motion } from 'framer-motion'
-import { Compass, Globe, ImagePlus, Network, Rocket, Shapes, Sparkles, Wand2, type LucideIcon } from 'lucide-react'
+import { Compass, Globe, Image as ImageIcon, ImagePlus, Network, Rocket, Shapes, Sparkles, Wand2, type LucideIcon } from 'lucide-react'
 import { CATALOG } from '@/lib/ai/catalog/catalog'
 import { Composer } from './composer'
 import { OeLogo, ReadyBadge } from './oe-logo'
@@ -28,6 +28,12 @@ const SUGGESTIONS = [
     icon: Shapes,
     label: 'Diseña un icono SVG',
     prompt: 'Genera un icono SVG de un cohete, estilo flat minimalista',
+  },
+  {
+    key: 'gallery',
+    icon: ImageIcon,
+    label: 'Trae imágenes de la web',
+    prompt: 'Muéstrame imágenes de arquitectura brutalista impresionante y cuéntame qué hace especial a cada edificio',
   },
   {
     key: 'search',

@@ -16,7 +16,7 @@ import {
   createGeminiDirectMiniAdapter,
   geminiSearchWeb,
 } from '@/lib/ai/gemini-direct'
-import { detectMediaIntent } from '@/lib/ai/image-intent'
+import { detectGalleryIntent, detectMediaIntent } from '@/lib/ai/image-intent'
 import { generateImageWithCascade } from '@/lib/ai/image-cascade'
 import { generateSvgCode } from '@/lib/ai/svg-generator'
 
@@ -286,8 +286,16 @@ export async function POST(request: Request) {
   // (la cuota de invitado ya se consumió arriba: 1 turno = 1 uso) y responde por
   // SSE con eventos dedicados. No aplica si hay adjunto de visión, modo voz,
   // intérprete, contexto de constructor o documento leído (esos turnos son chat).
-  const mediaIntent =
+  // PRIORIDAD: si pide VER imágenes de la web ("busca/muéstrame imágenes de…")
+  // es una GALERÍA (búsqueda real), no generación: el turno sigue siendo chat
+  // con una directiva que obliga a emitir el bloque :::gallery.
+  const galleryTurn =
     !attachment && !body.voice && body.translatorTarget === '' && !body.buildContext && !body.docContext
+      ? detectGalleryIntent(body.message)
+      : null
+  const mediaIntent = galleryTurn
+    ? null
+    : !attachment && !body.voice && body.translatorTarget === '' && !body.buildContext && !body.docContext
       ? detectMediaIntent(body.message)
       : null
 
@@ -566,15 +574,26 @@ export async function POST(request: Request) {
   // idioma del usuario y la interpretación natural de lo que escribe.
   const LANGUAGE_RULE =
     ' Responde SIEMPRE en el idioma en el que escribe el usuario (por defecto, español). Si escribe con errores de tipeo o abreviaturas (p. ej. "hoa"), interpreta la intención obvia y responde con naturalidad, sin pedir aclaraciones innecesarias ni analizar el error.'
-  // Formato rico (interfaz estilo GPT): tarjetas con icono para secciones/planes.
+  // Formato rico (interfaz estilo GPT): planes con timeline, tarjetas con
+  // icono y galerías con imágenes reales de la web traídas al chat.
   const RICH_FORMAT_RULE =
-    '\n\nFORMATO RICO: cuando la respuesta tenga varias secciones paralelas (planes por fases, auditorías, categorías, comparativas, listas de características), usa bloques de tarjetas con esta sintaxis EXACTA:\n:::cards\n- zap | Título corto | Descripción de una o dos frases.\n- mic | Otro título | Otra descripción.\n:::\nEl icono (antes del primer |) debe ser UNA de estas palabras: zap, mic, eye, shield, database, cpu, globe, image, code, rocket, settings, users, lock, brain, sparkles, wrench, cloud, phone, mail, clock, check, book, search, bot, palette, video, music, folder, key, server, layers, box, star, heart, flag, compass, camera, terminal, bug, package, credit-card, trending-up, target, award, briefcase, building, home, leaf, sun, moon, flame, link, map, gift, wifi, activity, dollar, message, play, file, calendar, cart, truck, headphones, gamepad, plane, car, graduation, pulse, scale, lightbulb.\nUsa como máximo UN bloque por respuesta, con 2-6 tarjetas; el resto del texto en markdown normal. No uses :::cards si la respuesta es corta o conversacional.'
+    '\n\nFORMATO RICO: tienes tres bloques especiales para respuestas interactivas (sintaxis EXACTA, sin markdown dentro):\n' +
+    '1) PLAN por fases (cuando pidan un plan, roadmap, estrategia o pasos ordenados):\n:::plan\n- Título del paso | Explicación de una o dos frases.\n- Siguiente paso | Su explicación.\n:::\n' +
+    '2) TARJETAS con icono (secciones paralelas: categorías, auditorías, comparativas, características):\n:::cards\n- zap | Título corto | Descripción de una o dos frases.\n- mic | Otro título | Otra descripción.\n:::\n' +
+    'El icono (antes del primer |) debe ser UNA de estas palabras: zap, mic, eye, shield, database, cpu, globe, image, code, rocket, settings, users, lock, brain, sparkles, wrench, cloud, phone, mail, clock, check, book, search, bot, palette, video, music, folder, key, server, layers, box, star, heart, flag, compass, camera, terminal, bug, package, credit-card, trending-up, target, award, briefcase, building, home, leaf, sun, moon, flame, link, map, gift, wifi, activity, dollar, message, play, file, calendar, cart, truck, headphones, gamepad, plane, car, graduation, pulse, scale, lightbulb.\n' +
+    '3) GALERÍA con imágenes reales de la web (cuando el tema tenga elementos VISUALES: lugares, animales, arte, arquitectura, deportes, comida, personas famosas, productos, diseño, moda, vehículos, naturaleza, tecnología visual…, o cuando te pidan imágenes/ejemplos visuales):\n:::gallery\n- Título | Descripción de una frase. | consulta de busqueda en ingles\n- Otro título | Otra descripción. | otra consulta ingles\n:::\nLa consulta (tercer campo) va EN INGLÉS, 2-5 palabras, muy descriptiva y fotográfica (p. ej. "modern skyscraper night lights"). Usa 2-4 filas por galería.\n' +
+    'Reglas: máximo DOS bloques por respuesta y solo si aportan valor; el resto del texto en markdown normal (párrafos, listas, negritas). No uses bloques si la respuesta es corta o conversacional. NUNCA inventes URL de imágenes: las imágenes las busca la plataforma a partir de la consulta.'
+  // Estilo de respuesta: desarrollada, cálida y con energía (nada de respuestas
+  // de una línea cuando el tema lo amerita), como un asistente premium.
+  const STYLE_RULE =
+    '\n\nESTILO DE RESPUESTA: desarrolla tus respuestas con sustancia: contexto, ejemplos concretos, matices y un cierre útil (una sugerencia de siguiente paso o una pregunta que invite a seguir). Para preguntas abiertas escribe varias secciones o párrafos bien organizados; evita contestar en una sola línea salvo saludos o preguntas de sí/no. Tono cálido, cercano y con energía positiva, como un experto amigo: alguna interjección natural está bien. Usa emojis con moderación (máximo 1-2 por respuesta) y nunca repitas la misma estructura mecánicamente.'
   const baseSystem =
     (body.mode === 'reflective'
       ? 'Eres OE AI LLM, el modelo unificado de OE BUSINESS. Responde con razonamiento paso a paso, cuidadoso y bien estructurado, usando markdown cuando ayude a la claridad.'
       : 'Eres OE AI LLM, el modelo unificado de OE BUSINESS. Responde de forma directa, clara y útil, usando markdown cuando ayude a la claridad.') +
     LANGUAGE_RULE +
-    RICH_FORMAT_RULE
+    RICH_FORMAT_RULE +
+    STYLE_RULE
   const systemMessages: ChatRequestMessage[] = []
   if (body.translatorTarget) {
     const langName = TRANSLATOR_LANGUAGE_NAMES[body.translatorTarget]
@@ -603,6 +622,11 @@ export async function POST(request: Request) {
     // solo cuando la consulta trata sobre el tamaño o la arquitectura de OE AI.
     if (shouldAttachCapacityDoc(body.message)) {
       systemContent = `${systemContent}\n\n${CAPACITY_SYSTEM_BLOCK}`
+    }
+    // Turno de GALERÍA: el usuario pidió ver imágenes reales del tema X. Se
+    // obliga a emitir el bloque :::gallery (la plataforma busca las fotos).
+    if (galleryTurn) {
+      systemContent = `${systemContent}\n\nGALERÍA DE LA WEB OBLIGATORIA: el usuario pidió ver imágenes reales sobre "${galleryTurn.subject}". Tu respuesta DEBE incluir exactamente UN bloque :::gallery con 3-4 filas en este formato EXACTO:\n- Título breve | Frase que explica qué muestra la imagen y por qué importa. | consulta de busqueda en ingles\nLas consultas (tercer campo) van EN INGLÉS, 3-5 palabras, descriptivas y fotográficas, y cada una cubre un ángulo distinto del tema. Añade además un párrafo de introducción y comentarios en markdown sobre lo que se ve; las imágenes NO las inventas tú: las busca la plataforma.`
     }
     // Constructor de apps: la directiva ```oe-build se emite solo cuando el
     // usuario pide construir/crear una app completa (no para dudas de código,

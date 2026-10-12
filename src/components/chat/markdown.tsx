@@ -8,6 +8,11 @@
  * FORMATO RICO (respuestas interactivas estilo GPT):
  * - Bloques :::cards … ::: → tarjetas con icono, título y descripción
  *   (sintaxis: `- icono | Título | Descripción`, icono = nombre lucide).
+ * - Bloques :::plan … ::: → plan/timeline con pasos numerados y conector.
+ * - Bloques :::gallery … ::: → canvas con imágenes REALES de la web:
+ *   `- Título | Descripción | consulta en inglés`; cada fila busca en
+ *   /api/tools/image-search (resultados re-hosteados, estables) y muestra
+ *   la foto con esqueleto de carga y respaldo si la búsqueda falla.
  * - Bloques :::svg … ::: → tarjeta con vista previa del SVG y descarga
  *   en .svg o .png (rasterizado local en canvas).
  * Los bloques se renderizan incluso a mitad del streaming (filas parciales),
@@ -22,7 +27,7 @@
  * se inyecta SOLO como `src` de <img> (data URL), nunca como DOM crudo, por lo
  * que los scripts embebidos en el SVG no se ejecutan.
  */
-import { memo, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import {
   Activity, Award, Bot, Box, Briefcase, Bug, Building, Calendar, Camera, Car, Check, Clock, Cloud,
   Code, Compass, Copy, CreditCard, Cpu, Database, DollarSign, Download, Eye, FileText, Flame, Flag,
@@ -152,6 +157,8 @@ function CodeBlock({
 type RichSegment =
   | { type: 'md'; text: string }
   | { type: 'cards'; text: string; closed: boolean }
+  | { type: 'plan'; text: string; closed: boolean }
+  | { type: 'gallery'; text: string; closed: boolean }
   | { type: 'svg'; text: string; closed: boolean }
 
 /**
@@ -169,16 +176,16 @@ function splitRichSegments(src: string): RichSegment[] {
       segments.push({ type: 'md', text: '```' + chunk })
       return
     }
-    // Segmento de texto: localizar bloques :::cards / :::svg
+    // Segmento de texto: localizar bloques :::cards / :::plan / :::gallery / :::svg
     let rest = chunk
     while (true) {
-      const open = /[ \t]*:::(cards|svg)[ \t]*(?:-[^\n]*)?\n?/.exec(rest)
+      const open = /[ \t]*:::(cards|svg|plan|gallery)[ \t]*(?:-[^\n]*)?\n?/.exec(rest)
       if (!open) {
         if (rest) segments.push({ type: 'md', text: rest })
         break
       }
       if (open.index > 0) segments.push({ type: 'md', text: rest.slice(0, open.index) })
-      const kind = open[1] === 'svg' ? 'svg' : 'cards'
+      const kind = (open[1] === 'svg' ? 'svg' : open[1]) as Exclude<RichSegment, { type: 'md' }>['type']
       const after = rest.slice(open.index + open[0].length)
       const closeIdx = after.search(/^[ \t]*:::[ \t]*$/m)
       if (closeIdx === -1) {
@@ -235,12 +242,169 @@ function CardGroup({ items }: { items: CardItem[] }) {
                 )}
               </span>
               <div className="min-w-0">
-                <p className="text-sm font-medium leading-snug">{card.title}</p>
+                <p className="oe-display text-sm font-medium leading-snug">{card.title}</p>
                 {card.desc && <p className="mt-0.5 text-[13px] leading-relaxed text-muted-foreground">{card.desc}</p>}
               </div>
             </div>
           )
         })}
+      </div>
+    </div>
+  )
+}
+
+/* ── Plan con timeline (pasos numerados y conector vertical) ────────────── */
+
+interface PlanStep {
+  title: string
+  desc: string
+}
+
+/** Parser tolerante de filas `- Título | Descripción`. */
+function parsePlanRows(text: string): PlanStep[] {
+  return text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.replace(/^[-*•]\s*/, ''))
+    .map((line) => {
+      const parts = line.split('|').map((p) => p.trim())
+      if (parts.length >= 2) return { title: parts[0], desc: parts.slice(1).join(' · ') }
+      return { title: parts[0] ?? '', desc: '' }
+    })
+    .filter((s) => s.title.length > 0 && !/^[.:;\s—-]*$/.test(s.title))
+    .slice(0, 8)
+}
+
+function PlanBlock({ steps }: { steps: PlanStep[] }) {
+  return (
+    <div className="oe-md-plan my-3 overflow-hidden rounded-2xl border border-border/70 bg-card/30">
+      <div className="flex items-center gap-2 border-b border-border/50 px-4 py-2.5">
+        <Target className="size-3.5 text-emerald-300" aria-hidden />
+        <span className="oe-display text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+          Plan
+        </span>
+      </div>
+      <ol className="px-4 py-3.5">
+        {steps.map((step, i) => (
+          <li key={`${i}-${step.title}`} className="relative flex gap-3 pb-4 last:pb-0">
+            {i < steps.length - 1 && (
+              <span className="absolute bottom-0 left-[13px] top-8 w-px bg-gradient-to-b from-emerald-400/35 to-border/50" aria-hidden />
+            )}
+            <span className="relative z-10 flex size-7 shrink-0 items-center justify-center rounded-full border border-emerald-400/30 bg-emerald-400/10 text-[12px] font-semibold text-emerald-300">
+              {i + 1}
+            </span>
+            <div className="min-w-0 pt-0.5">
+              <p className="oe-display text-sm font-medium leading-snug">{step.title}</p>
+              {step.desc && <p className="mt-0.5 text-[13px] leading-relaxed text-muted-foreground">{step.desc}</p>}
+            </div>
+          </li>
+        ))}
+      </ol>
+    </div>
+  )
+}
+
+/* ── Galería con imágenes reales de la web (canvas visual) ──────────────── */
+
+interface GalleryItem {
+  title: string
+  desc: string
+  query: string
+}
+
+/**
+ * Parser de filas `- Título | Descripción | consulta en inglés`.
+ * Tolerante: 2 campos → título + consulta. Las filas cuya "consulta" es una
+ * URL se descartan (las imágenes SIEMPRE las busca la plataforma, nunca URLs
+ * elegidas por el modelo).
+ */
+function parseGalleryRows(text: string): GalleryItem[] {
+  return text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.replace(/^[-*•]\s*/, ''))
+    .map((line) => {
+      const parts = line.split('|').map((p) => p.trim())
+      if (parts.length >= 3) return { title: parts[0], desc: parts.slice(1, -1).join(' · '), query: parts[parts.length - 1] }
+      if (parts.length === 2) return { title: parts[0], desc: '', query: parts[1] }
+      return { title: parts[0] ?? '', desc: '', query: '' }
+    })
+    .filter((g) => g.title.length > 0 && g.query.length > 1 && !/^https?:\/\//i.test(g.query))
+    .slice(0, 6)
+}
+
+type GalleryHitState = { status: 'loading' } | { status: 'ok'; url: string } | { status: 'error' }
+
+function GalleryRow({ item, index }: { item: GalleryItem; index: number }) {
+  const [hit, setHit] = useState<GalleryHitState>({ status: 'loading' })
+
+  useEffect(() => {
+    let alive = true
+    // Debounce: durante la cascada del streaming la consulta crece carácter a
+    // carácter; solo buscamos cuando la fila lleva 700 ms sin cambiar (fila
+    // completa) para no disparar una petición por cada letra ni quemar el
+    // límite de peticiones del endpoint.
+    const timer = window.setTimeout(() => {
+      if (item.query.trim().length < 4) {
+        setHit({ status: 'error' })
+        return
+      }
+      fetch(`/api/tools/image-search?q=${encodeURIComponent(item.query)}&count=1`)
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`status ${r.status}`))))
+        .then((data: { results?: Array<{ url?: string }> }) => {
+          if (!alive) return
+          const url = data.results?.[0]?.url
+          setHit(url ? { status: 'ok', url } : { status: 'error' })
+        })
+        .catch(() => {
+          if (alive) setHit({ status: 'error' })
+        })
+    }, 700)
+    return () => {
+      alive = false
+      window.clearTimeout(timer)
+    }
+  }, [item.query])
+
+  return (
+    <div className="flex items-start gap-3.5 p-4">
+      <div className="oe-gallery-tile relative size-20 shrink-0 overflow-hidden rounded-xl border border-border/50 bg-secondary/40 sm:size-24">
+        {hit.status === 'loading' && <div className="absolute inset-0 animate-pulse bg-secondary/70" aria-hidden />}
+        {hit.status === 'ok' && (
+          <img
+            src={hit.url}
+            alt={item.title}
+            loading="lazy"
+            referrerPolicy="no-referrer"
+            className="size-full object-cover transition-transform duration-500 hover:scale-[1.04]"
+          />
+        )}
+        {hit.status === 'error' && (
+          <div className="flex size-full items-center justify-center text-muted-foreground/60">
+            <ImageIcon className="size-5" aria-hidden />
+          </div>
+        )}
+      </div>
+      <div className="min-w-0 flex-1 pt-0.5">
+        <p className="oe-display text-sm font-medium leading-snug">
+          <span className="mr-1.5 text-muted-foreground/80">{index + 1}.</span>
+          {item.title}
+        </p>
+        {item.desc && <p className="mt-1 text-[13px] leading-relaxed text-muted-foreground">{item.desc}</p>}
+      </div>
+    </div>
+  )
+}
+
+function GalleryBlock({ items }: { items: GalleryItem[] }) {
+  return (
+    <div className="oe-md-gallery my-3 overflow-hidden rounded-2xl border border-border/70 bg-card/30">
+      <div className="divide-y divide-border/50">
+        {items.map((item, i) => (
+          <GalleryRow key={`${i}-${item.query}`} item={item} index={i} />
+        ))}
       </div>
     </div>
   )
@@ -360,18 +524,32 @@ function SvgCard({ code }: { code: string }) {
 
 /* ── Segmento markdown normal (comportamiento previo, intacto) ──────────── */
 
-function MarkdownSegment({ text, onOpenCanvas }: { text: string; onOpenCanvas?: (code: string) => void }) {
+/** Clases de prosa serif (variante asistente, estilo Claude). */
+function proseCls(serif: boolean | undefined, extra?: string): string {
+  return cn(extra, serif && 'oe-serif-text')
+}
+
+function MarkdownSegment({
+  text,
+  onOpenCanvas,
+  serif,
+}: {
+  text: string
+  onOpenCanvas?: (code: string) => void
+  /** true: prosa del asistente en serif editorial (estilo Claude). */
+  serif?: boolean
+}) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       components={{
-        h1: (p) => <h1 className="mt-4 mb-2 text-lg font-semibold tracking-tight first:mt-0" {...p} />,
-        h2: (p) => <h2 className="mt-4 mb-2 text-base font-semibold tracking-tight first:mt-0" {...p} />,
-        h3: (p) => <h3 className="mt-3 mb-1.5 text-sm font-semibold first:mt-0" {...p} />,
-        p: (p) => <p className="my-2 first:mt-0 last:mb-0" {...p} />,
+        h1: (p) => <h1 className={proseCls(serif, 'oe-display mt-4 mb-2 text-lg font-semibold tracking-tight first:mt-0')} {...p} />,
+        h2: (p) => <h2 className={proseCls(serif, 'oe-display mt-4 mb-2 text-base font-semibold tracking-tight first:mt-0')} {...p} />,
+        h3: (p) => <h3 className={proseCls(serif, 'oe-display mt-3 mb-1.5 text-sm font-semibold first:mt-0')} {...p} />,
+        p: (p) => <p className={proseCls(serif, 'my-2 first:mt-0 last:mb-0')} {...p} />,
         ul: (p) => <ul className="my-2 list-disc space-y-1 pl-5 last:mb-0" {...p} />,
         ol: (p) => <ol className="my-2 list-decimal space-y-1 pl-5 last:mb-0" {...p} />,
-        li: (p) => <li className="leading-relaxed" {...p} />,
+        li: (p) => <li className={proseCls(serif, 'leading-relaxed')} {...p} />,
         a: (p) => (
           <a
             className="font-medium text-emerald-300 underline decoration-emerald-400/40 underline-offset-2 hover:decoration-emerald-300"
@@ -391,7 +569,10 @@ function MarkdownSegment({ text, onOpenCanvas }: { text: string; onOpenCanvas?: 
           return <img src={url} alt={alt ?? ''} {...rest} className="my-2 max-w-full rounded-lg" />
         },
         blockquote: (p) => (
-          <blockquote className="my-2 border-l-2 border-emerald-500/40 pl-3 text-muted-foreground" {...p} />
+          <blockquote
+            className={proseCls(serif, 'my-2 border-l-2 border-emerald-500/40 pl-3 text-muted-foreground')}
+            {...p}
+          />
         ),
         hr: () => <hr className="my-3 border-border/60" />,
         table: (p) => (
@@ -438,11 +619,14 @@ export const Markdown = memo(function Markdown({
   content,
   className,
   onOpenCanvas,
+  serif,
 }: {
   content: string
   className?: string
   /** Si llega, los bloques ```html muestran el botón Canvas (solo asistente). */
   onOpenCanvas?: (code: string) => void
+  /** true: prosa del asistente en serif editorial (estilo Claude). */
+  serif?: boolean
 }) {
   const segments = useMemo(() => splitRichSegments(content), [content])
   return (
@@ -452,6 +636,14 @@ export const Markdown = memo(function Markdown({
           const items = parseCards(seg.text)
           return items.length > 0 ? <CardGroup key={i} items={items} /> : null
         }
+        if (seg.type === 'plan') {
+          const steps = parsePlanRows(seg.text)
+          return steps.length > 0 ? <PlanBlock key={i} steps={steps} /> : null
+        }
+        if (seg.type === 'gallery') {
+          const items = parseGalleryRows(seg.text)
+          return items.length > 0 ? <GalleryBlock key={i} items={items} /> : null
+        }
         if (seg.type === 'svg') {
           const trimmed = seg.text.trim()
           if (!trimmed) return null
@@ -460,7 +652,7 @@ export const Markdown = memo(function Markdown({
           if (!seg.closed) return <CodeBlock key={i} code={trimmed} lang="svg" />
           return <SvgCard key={i} code={trimmed} />
         }
-        return <MarkdownSegment key={i} text={seg.text} onOpenCanvas={onOpenCanvas} />
+        return <MarkdownSegment key={i} text={seg.text} onOpenCanvas={onOpenCanvas} serif={serif} />
       })}
     </div>
   )

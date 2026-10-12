@@ -484,7 +484,7 @@ function AssistantContent({ msg, onOpenCanvas }: { msg: ChatMsg; onOpenCanvas: (
             tablas, negritas y listas se ven formateadas desde el primer frame
             (sin mostrar nunca la sintaxis cruda). */}
         <div className={cn(!msg.complete && 'oe-caret')}>
-          <Markdown content={msg.content} onOpenCanvas={onOpenCanvas} />
+          <Markdown content={msg.content} onOpenCanvas={onOpenCanvas} serif />
         </div>
       </div>
 

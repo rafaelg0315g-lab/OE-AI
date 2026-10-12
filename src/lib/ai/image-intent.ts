@@ -104,3 +104,52 @@ export function detectMediaIntent(rawMessage: string): MediaIntent | null {
 
   return { format, subject, prompt, size }
 }
+
+/* ── Intención de GALERÍA: ver imágenes REALES de la web (no crear) ──────── */
+
+/** Verbos de búsqueda/visualización (ver lo que ya existe en la web). */
+const SEARCH_VERB =
+  /\b(busca|b[úu]scame|busca[rme]|buscar|muestrame|mu[eé]strame|ens[eé][ñn]ame|tr[aá]eme|traeme|encuentra|encuentrame|encu[eé]ntrame|find|show me|search(?: for)?|looking for)\b/i
+
+/** Objetos de búsqueda visual: imágenes/fotos existentes (NO icono/svg/logo). */
+const SEARCH_OBJECT =
+  /\b(im[áa]genes?|imagenes?|fotos?|fotograf[íi]as?|pictures?|pics|photos?|fotograf[ií]as)\b/i
+
+/** Verbos de creación fuertes: si están, el usuario QUIERE generar (no buscar). */
+const STRONG_CREATE_VERB =
+  /\b(crea|crea[rme]|creáme|genera|genera[rme]|genérame|haz|hazme|hacer|dibuja|dibújame|pinta|p[íi]ntame|dise[ñn]a|dise[ñn]ame|make|create|generate|draw|design|paint|render)\b/i
+
+export interface GalleryIntent {
+  /** Tema del que buscar imágenes (para la directiva del system prompt). */
+  subject: string
+}
+
+/**
+ * Detecta peticiones de VER imágenes reales de la web ("busca fotos de…",
+ * "muéstrame imágenes de…", "imágenes de arquitectura brutalista…").
+ * Devuelve null si el mensaje es de generación (verbos de creación), si no
+ * menciona imágenes/fotos o si es conversación normal: entonces el turno
+ * sigue siendo chat o generación de medios según el orden del router.
+ */
+export function detectGalleryIntent(rawMessage: string): GalleryIntent | null {
+  const message = rawMessage.trim()
+  if (!message || message.length > MAX_INTENT_CHARS) return null
+  if (STRONG_CREATE_VERB.test(message)) return null
+
+  const objectMatch = SEARCH_OBJECT.exec(message)
+  if (!objectMatch) return null
+
+  const searchVerb = SEARCH_VERB.test(message)
+  const startsWithObject = objectMatch.index === 0
+  if (!searchVerb && !startsWithObject) return null
+
+  // Sujeto: lo que sigue al objeto ("imágenes DE arquitectura brutalista").
+  let subject = message.slice(objectMatch.index + objectMatch[0].length)
+  subject = subject
+    .replace(/^[\s:,;—–-]*(de|del|sobre|acerca de|con tema de|of|about)\s+/i, '')
+    .replace(/^[\s.,;:—–-]+/, '')
+    .replace(/[\s.!?¡¿]+$/, '')
+    .trim()
+  if (subject.length < 3) subject = message
+  return { subject: subject.slice(0, 200) }
+}
