@@ -766,3 +766,32 @@ Stage Summary:
 - Rutas antiguas /api/tools/build-app y /api/web-factory/generate intactas (fallback); ProjectFilesBlock (oeproject) sigue renderizando los builds antiguos del historial.
 - Commit 1094f2a pusheado a main (Vercel despliega solo); SIN env vars nuevas.
 - Deuda menor: el stream en dev a veces entrega ráfagas retardadas tras silencios largos (buffer de compresión del dev server); el latido de 7s lo mitiga; en producción (Vercel) no aplica. /api/assets/upload sigue sin existir (adjuntar imagen para visión 404 — preexistente).
+
+---
+Task ID: 38
+Agent: Z.ai Code (principal)
+Task: Arreglar "preparación de apps" buguiada (0/1 tareas, sin código, error "Gemini cuota 0") y añadir NVIDIA NIM + OpenRouter como IAs de código abierto para generar código.
+
+Work Log:
+- Diagnóstico con 3 causas reales (no una):
+  1) El ROUTER priorizaba rutas free verificadas para tareas de código → primario OpenRouter `google/gemma-4-31b-it:free` (429 upstream permanente) → respaldo Gemini (cuota=0) → el usuario veía "Gemini: cuota del modelo = 0" (gemini-direct.ts:104) porque NVIDIA no existía en la cadena.
+  2) `detectMediaIntent` secuestraba "genera un HTML de una tarjeta con avatar" como turno de IMAGEN (palabra "avatar") → el usuario pedía código y recibía errores de generadores visuales.
+  3) Panel 0/1 congelado: snapshot inicial del cliente tenía 1 tarea; si el SSE moría (o el server moría: exit 130 SIGINT del sandbox mató builds del propietario a mitad), quedaba 0/1 + polling eterno. Además bug REAL: `clearInterval(heartbeat)` en finally con heartbeat en TDZ (chunk stale de Turbopack) → ReferenceError → build-stream 500 sin eventos.
+- NVIDIA NIM integrado (clave nueva del propietario, 80 modelos): sondas reales → kimi-k2.6 404 para esta cuenta, deepseek-v4.1-flash 68s (lento), glm-5.3-flash 24s parcial; GANADOR `nvidia/nemotron-3-super-120b-a12b`: 7.5KB de JSON de código en 24.6s con `chat_template_kwargs:{thinking:false}` (sin eso quema 16k tokens en reasoning y devuelve content vacío). Streaming SSE verificado.
+- build/llm.ts reescrito a DOS FASES (patrón image-cascade): FASE 1 carrera paralela NVIDIA ↔ OpenRouter (`nvidia/nemotron-3-super-120b-a12b:free`, el gpt-oss-20b pago estaba con créditos=0) ↔ z-ai, raceRacers resuelve con el primero; FASE 2 respaldos secuenciales Gemini→Groq solo si toda la carrera falla. E2E: build completo 2.3min → 52s; NVIDIA ganó 5/6 llamadas.
+- providers/index.ts: def `nvidia` (baseUrl integrate.api.nvidia.com, streaming true, verified); openai-compatible.ts envía `chat_template_kwargs:{thinking:false}` para nvidia en chat() y chatStream().
+- chat/route.ts: runtimeFallbacks reordenados OpenRouter → NVIDIA → Gemini. Resultado: el router ahora sirve HTML/código DIRECTO por NVIDIA (prueba real: HTML real en 4.7s, sin tocar Gemini). Chat normal sigue por z-ai.
+- image-intent.ts: guardia CODE_REQUEST_RE + CORE_VISUAL_RE — "genera un HTML/página web/código" nunca más es turno de imagen salvo que se mencione un objeto visual nuclear ("genera UNA IMAGEN de una web"). Tests unitarios 8/8.
+- use-oe-chat.ts: extractBuildDirective reescrita — acepta `:::oe-build {...} :::` y `:::oe-web` multiline además de las vallas ```; extrae el primer JSON balanceado tras el marcador. Testeada con el payload EXACTO del propietario (App Joyería Elegante) 5/5 casos. Snapshot inicial con la lista completa de tareas (app: 5, web: 6) → el panel NUNCA arranca en 0/1; describeBuildError con 'build_interrupted'.
+- markdown.tsx: splitter reconoce :::oe-build/:::oe-web → renderiza BuildDirectivePending (nunca JSON crudo en streaming).
+- builder-directive.ts: regla "FORMATO EXACTO": directiva SIEMPRE con vallas ``` y NUNCA :::.
+- build-stream/status: resolveOrphanBuild — proyecto 'building' >6min (peor caso real 4.3min) = huérfano (proceso muerto por SIGINT/reinicio) → persiste status error 'build_interrupted' ANTES del deadline de 8min del cliente; el panel resuelve con mensaje honesto en vez de sondear para siempre.
+- build-stream route: heartbeat hoisted fuera del try (fix ReferenceError/500); pipeline.ts loguea el motivo de rechazo de cada mitad paralela (backend:rejected era invisible).
+- .env: NVIDIA_API_KEY añadida; OE_AI_MODEL_ROUTES ahora `openrouter:nvidia/nemotron-3-super-120b-a12b:free, openrouter:google/gemma-4-31b-it:free, nvidia:nvidia/nemotron-3-super-120b-a12b`.
+- OJO operación: `pm2 restart --update-env` NO re-parsea .env (borró NVIDIA_API_KEY del proceso y reprodujo el bug en vivo); SIEMPRE `pm2 delete oe-ai-dev && pm2 start ecosystem.config.js --only oe-ai-dev`. .next purgado (rm -rf) por chunks stale de Turbopack (causa del ReferenceError fantasma).
+
+Stage Summary:
+- Verificado E2E en navegador (invitado, arranque en frío): "crea una app de calculadora de propinas" → panel TAREAS 1/5→5/5 con spinners y checks, 6 chips con descarga individual desde que cada archivo existe, código resaltado en vivo, botón "Descargar ZIP" a los ~50s; ZIP descargado por curl: 200, 17.8KB, 6 archivos dentro. Sin errores de consola.
+- build-stream curl E2E: 52s total, 6 archivos, done con zipUrl. Chat HTML: core=NVIDIA NIM, HTML real en 4.7s. Chat normal: z-ai intacto. Web Factory (kind=web): 7 archivos, ZIP, 256s.
+- Commit d1ac247 pusheado a main. PARA VERCEL el propietario debe añadir: NVIDIA_API_KEY (nvapi-ZrvkbP…) y actualizar OE_AI_MODEL_ROUTES con la ruta nvidia + nemotron free primero.
+- Deuda conocida: sandbox envía SIGINT al dev server (exit 130) de vez en cuando — pm2 lo revive y ahora los builds huérfanos se marcan como error a los 6 min; los OpenRouter :free tienen cap diario (la carrera lo absorbe).
