@@ -737,3 +737,32 @@ Stage Summary:
 - PM2 ahora es permanente en la medida posible del sandbox: autorestart ante crashes, dump persistido y auto-revive vía hook de .bashrc + scripts/restore-server.sh (idempotente).
 - Si vuelve a morir: basta abrir una terminal (hook .bashrc) o ejecutar bash scripts/restore-server.sh.
 - Sin cambios en código de la app ni env vars nuevas para Vercel.
+
+---
+Task ID: 37
+Agent: Z.ai Code (principal)
+Task: Constructor de apps EN VIVO (lista de tareas estilo Todos + código streaming + descarga por archivo + ZIP) + imágenes: fix 502 (carrera de proveedores), animación aurora-nube, intención ampliada, prompts con contexto/web/marcas.
+
+Work Log:
+- FIX 502 imágenes (causa raíz: z-ai tardaba 77-95s en cadena → timeout de proxy/Vercel): image-cascade.ts ahora FASE 1 = carrera paralela pollinations ↔ z-ai (gana el primero, raceGenerators con AggregateError solo si ambos fallan) + seed aleatorio para regenerar variedad; FASE 2 = gemini-direct → openrouter secuenciales. E2E: imagen OK en 10.3s (ganó pollinations) y 94.9s (ganó z-ai); antes: 77s garantizados.
+- Turno de medios (/api/chat): heartbeat SSE cada 7s con stage {note, elapsed} ("Analizando tu petición…" → "Componiendo la escena…" → …) que alimenta la animación; done.webSearchUsed ahora refleja el grounding real.
+- Enriquecimiento de prompts (NEW src/lib/ai/image-prompt.ts): buildImagePrompt() resuelve sujetos contextuales ("genera una imagen del tema") con el historial reciente vía LLM (timeout 12s + fallback); WEB_GROUND_RE (marca|logo|empresa|lugar|celebridad|de la web…) dispara searchWebImages(3) e inyecta referencias reales en el prompt ("colocar marcas y más, todo lo que esté en la web"); sufijo de dirección de arte; iconos SIEMPRE conservan su guía vectorial.
+- image-intent.ts ampliado: verbos débiles (quiero|quisiera|deseo|necesito|dame|hazme|dibújame/dibujame|píntame/pintame|ilústrame|créame|genérame|convierte|transforma|renderiza|give me|i want…), objetos nuevos (fotografía|retrato|caricatura|mockup|flyer|cartel|miniatura|thumbnail|tatuaje|tattoo|mural|pintura|monograma|pixel art|concept art|emote), avatar/emote → formato icon (PNG); galería con deseo débil + objeto plural = búsqueda web ("quiero imagenes de París"), singular sin artículo = generación ("quiero UNA imagen de París"); tests unitarios 14/14 OK.
+- Animación aurora-nube (NEW image-pending-placeholder.tsx): 4 blobs aurora (esmeralda/teal/violeta/cielo) blur 70-80px con deriva orgánica framer-motion + 3 nubes blancas en deriva lenta + rejilla de puntos oe-aurora-drift + viñeta + Sparkles con anillo ping + notas de etapa SSE + timer + barra de progreso barrida + useReducedMotion; reemplaza al placeholder plano en message-list.
+- CONSTRUCTOR EN VIVO (petición del propietario con captura de UI de Todos):
+  · NEW src/lib/build/progress.ts: BuildProgressEvent (title|todos|todo_update|stage_note|file_done) + createProgressSink.
+  · Pipelines instrumentados con onProgress opcional: runBuild/runBuildUpdate (plan→frontend/backend→esenciales→paquete; file_done por archivo con contenido) y runWebFactory (plan→shell→páginas EN PARALELO con file_done por página al terminar→validación→README; modo edición con analyze/edit/package).
+  · NEW POST /api/tools/build-stream (SSE, kind app|web): misma cuota/rate-limit/persistencia que las rutas clásicas; PERSISTENCIA TEMPRANA de cada BuildFile en cuanto file_done (descarga individual disponible desde el primer archivo); eventos meta|build_meta|todos|todo|note|file{path,language,bytes,content,url}|done{files,zipUrl,previewUrl,checks…}|error; sin request.signal (el build sigue si el cliente se corta); latido note cada 7s durante fases largas.
+  · Hook use-oe-chat: NEW BuildLiveTodo/BuildLiveFile/BuildLiveSnapshot + msg.build; runBuildFlow reescrito a SSE (/api/tools/build-stream) con lector SSE propio y snapshot local; fallback resolveBuildByStatus si la conexión muere sin errorType; PATCH /api/chat/messages ahora acepta buildJson (histórico reconstruye el panel); historial hidrata msg.build desde buildJson (status building→ready al cargar); lastBuildRef prioriza buildJson.
+  · NEW build-live-panel.tsx: cabecera (título+nota+estado+timer), TAREAS con badge N/M (pendiente ○ / activa spinner / hecha ✓ tachado / fallida ✗), visor de código con chips por archivo (cada chip con botón de descarga individual desde que existe), revelado tipo cascada del código (mono plano durante la cascada + Prism oneDark al completar, auto-scroll), pie con botón "Descargar ZIP" (esmeralda) + "Vista previa" (webs html) + resumen N archivos · KB.
+  · message-list: rama msg.build (anuncio + panel) antes del placeholder legacy (BuildPendingPlaceholder queda para builds reanudados por sondeo).
+- Prisma: ChatMessage.buildJson (String?) + db:push OK (Supabase).
+- Seguridad: auto-commit del sandbox incluyó scripts/restore-server.sh con credenciales reales → push RECHAZADO por GitHub Push Protection (GCP API key). FIX: script reescrito SIN secretos (restaura .env desde ~/.oe-env-backup fuera del repo, aviso si no existe), backup real creado en /home/z/.oe-env-backup (chmod 600), historial reescrito (reset --soft a 07baa53 + 1 commit limpio) y push OK (1094f2a).
+- Lint limpio; tsc: solo preexistentes (completion/generate-route/doneMeta — verificados idénticos en HEAD; ignoreBuildErrors cubre).
+
+Stage Summary:
+- Verificado E2E en navegador (invitado): "crea una imagen de un panda kawaii comiendo bambu" → animación aurora-nube con etapas en vivo → imagen renderizada con caption/descargar/copiar/volver a generar (94.9s, z-ai). "crea una app de lista de tareas con contador" → panel con TAREAS 1/5→5/5 marcándose, chips de 6 archivos con descarga individual, visor de código resaltado (styles.css 4.7KB), botón Descargar ZIP; ZIP y descarga individual verificados por curl (200, bytes correctos).
+- build-stream curl E2E: meta→note→todos→build_meta→todo×4→file×6→done con zipUrl; proyecto status ready en Supabase.
+- Rutas antiguas /api/tools/build-app y /api/web-factory/generate intactas (fallback); ProjectFilesBlock (oeproject) sigue renderizando los builds antiguos del historial.
+- Commit 1094f2a pusheado a main (Vercel despliega solo); SIN env vars nuevas.
+- Deuda menor: el stream en dev a veces entrega ráfagas retardadas tras silencios largos (buffer de compresión del dev server); el latido de 7s lo mitiga; en producción (Vercel) no aplica. /api/assets/upload sigue sin existir (adjuntar imagen para visión 404 — preexistente).
