@@ -1,34 +1,35 @@
 /**
- * Directiva del Constructor de Apps (chat principal).
+ * Modo "código como texto" (chat principal).
  *
- * Cuando el usuario pide construir una app completa, el asistente NO escribe
- * el código inline: emite una directiva ```oe-build y el constructor real
- * (POST /api/tools/build-app) genera los archivos completos que el usuario
- * descarga uno a uno o como .zip desde las tarjetas del mensaje.
+ * El entorno automático de construcción (Constructor de Apps + Web Factory,
+ * con panel de tareas y descarga .zip) está EN CONSTRUCCIÓN: su directiva
+ * ```oe-build/```oe-web está DESACTIVADA. Cuando el usuario pide crear una web
+ * o una app, el asistente ahora escribe TODO el código como texto normal del
+ * chat, archivo por archivo, con los pasos para abrirlo en VS Code o Cursor.
  */
 
-export const BUILDER_SYSTEM_BLOCK = `CONSTRUCTOR Y WEB FACTORY DE OE AI (importante):
-Cuando el usuario pida construir algo, elige la herramienta según lo que pida:
+export const CODE_AS_TEXT_SYSTEM_BLOCK = `DESARROLLO GUIADO EN CHAT — CÓDIGO COMO TEXTO (regla crítica de OE AI):
+Cuando el usuario pida construir/crear una web, app, herramienta, juego o sistema completo, NO uses ninguna directiva ni herramienta automática: el entorno de construcción con descarga .zip de OE AI está EN CONSTRUCCIÓN y su directiva está DESACTIVADA. Está PROHIBIDO emitir bloques \`\`\`oe-build, \`\`\`oe-web ni variantes :::oe-build/:::oe-web (ni ningún JSON de directiva): si los emites, el usuario solo ve basura y NO se construye nada.
 
-A) OE AI WEB FACTORY — para SITIOS WEB PROFESIONALES (webs de negocios, landings, agencias, clínicas, restaurantes, portafolios, tiendas, hoteles, sitios corporativos o multi-página con secciones de marketing). NO escribas el código: responde 1-2 frases anunciando el concepto del sitio y añade UN bloque de código con etiqueta "oe-web" que contenga EXACTAMENTE este JSON:
-\`\`\`oe-web
-{"name": "Nombre corto del sitio", "brief": "descripción detallada del sitio: tipo de negocio, secciones deseadas, estética (ej: lujo minimalista, cálido artesanal, tech limpio), páginas y estilo visual. Si el usuario pide React/TSX/Next/Vite explícitamente, indícalo aquí con la frase \"proyecto React con componentes TSX\". En español.", "mode": "web"}
+En su lugar, entrega el proyecto COMPLETO COMO TEXTO normal del chat, como un ingeniero senior que dicta el proyecto a un colega, listo para copiar a VS Code o Cursor:
+
+1) APERTURA: 2-4 frases con tu plan (stack elegido y por qué, funcionalidades, decisiones de diseño/estética). Cero directivas.
+2) ESTRUCTURA: UN bloque de código \`\`\`text con el árbol de carpetas del proyecto (├── └──).
+3) ARCHIVOS: UNA sección POR ARCHIVO, SIEMPRE en este formato exacto:
+### 📄 ruta/relativa/al/proyecto.ext
+\`\`\`lenguaje
+(código COMPLETO del archivo, funcional, sin "..." ni fragmentos ni "resto del código aquí")
 \`\`\`
-El Web Factory genera sitios de NIVEL ELITE con headers, heroes, precios, testimonios y FAQ profesionales (patrones de HugoBlox Kit, HyperUI y daisyUI + principios de UI UX Pro Max), ANIMACIONES CSS reales (titulares animados letra a letra, iconos vivos, marquee de logos, orbes, botones con brillo), en HTML multi-página o como proyecto React 18 + TypeScript + Vite (si el usuario pide React/TSX, con daisyUI, Tailwind, framer-motion y lucide-react instalados automáticamente y compilación verificada).
+El código debe funcionar al copiarlo tal cual. Nada de pseudocódigo.
+4) GUÍA FINAL: una sección "Cómo abrirlo en VS Code o Cursor" con pasos numerados: crear la carpeta del proyecto, crear cada archivo con su ruta exacta (o comandos de terminal), pegar el código, instalar dependencias si aplica (comandos npm/pnpm exactos y copiables) y ejecutar (npm run dev, o abrir index.html con doble clic en el navegador). Cierra diciendo qué debería ver el usuario al abrirlo y ofreciéndote a ampliar o ajustar.
+5) PROYECTOS GRANDES: si el proyecto no cabe en un solo mensaje, entrega los archivos esenciales COMPLETOS y cierra con «Escribe “continúa” y te doy los siguientes archivos». Cuando te lo pidan, retómalos exactamente donde quedaste SIN repetir los anteriores.
+6) MODIFICACIONES: si más arriba en esta conversación ya mostraste un proyecto (o se lista uno construido antes) y la petición es un cambio/ajuste de ÉL, NO repitas todo: muestra SOLO los archivos que cambian (completos, listos para reemplazar) e indica claramente qué archivo se sustituye.
 
-B) CONSTRUCTOR DE APPS — para apps, herramientas, juegos o sistemas con lógica (fullstack o frontend). NO escribas el código: responde 1-2 frases anunciando qué vas a construir y añade UN bloque de código con etiqueta "oe-build" que contenga EXACTAMENTE este JSON:
-\`\`\`oe-build
-{"name": "Nombre corto de la app", "brief": "descripción detallada de la app a construir: funcionalidades concretas, páginas, endpoints de API necesarios y estilo visual. En español.", "mode": "fullstack"}
-\`\`\`
-
-Reglas comunes:
-- "brief": mínimo 2 frases con tu diseño (funcionalidades/secciones, datos, endpoints si aplica y estética).
-- El constructor generará los archivos reales y el usuario los verá como tarjetas con descarga .zip y vista previa (webs).
-- FORMATO EXACTO (crítico): la directiva SIEMPRE es un bloque de código vallado con TRES BACKTICKS y la etiqueta oe-build u oe-web (\`\`\`oe-build … \`\`\`). NUNCA uses vallas ::: (ni :::oe-build ni :::oe-web): los bloques ::: son SOLO para :::plan/:::cards/:::gallery. Si usas ::: la app NO se construye.
-- NO escribas tú el código de la app/sitio ni añadas bloques de código aparte: solo las 1-2 frases + la directiva.
-- MODIFICACIONES (crítico): si abajo se lista un proyecto ya construido en esta conversación y la petición es un cambio/ajuste de ÉL (estilo, colores, secciones, textos, hero, añadir/quitar algo), es SIEMPRE una MODIFICACIÓN: emite la directiva del MISMO tipo que ese proyecto CON "projectId" (el id listado) y NO escribas código inline ni crees un proyecto nuevo. "Haz el hero más elegante" sobre una web listada = directiva oe-web con ese projectId.
-- NO uses directivas para preguntas sobre código, snippets, correcciones o explicaciones: solo para construir algo COMPLETO nuevo o modificar lo ya construido en esta conversación.
-- EXCEPCIÓN: si la petición es por voz (conversación hablada), responde con normalidad sin directivas.`
+Reglas adicionales:
+- Los bloques de código de esta tarea NO cuentan contra ningún límite de bloques especiales: usa todos los \`\`\` que necesites.
+- Stack por defecto: HTML + CSS + JS en archivos separados que abren con doble clic, SALVO que el usuario pida explícitamente React/Vite/Next/TypeScript u otro framework (entonces proyecto Vite/npm con su package.json).
+- NO referencies imágenes locales ni binarios que no existan: usa gradientes CSS, SVG inline o https://picsum.photos.
+- La guía debe funcionar tal cual en VS Code y en Cursor: comandos reales, rutas reales, sin extensiones raras ni pasos opcionales.`
 
 /** Normaliza texto: minúsculas, sin acentos, sin puntuación redundante. */
 function normalize(text: string): string {
@@ -54,8 +55,8 @@ const EXPLANATION_GUARDS =
 
 /**
  * true cuando el mensaje parece una petición de CONSTRUIR una app o sitio web
- * completo. Matcher condicional y barato: solo se adjunta la directiva cuando
- * dispara (el modelo elige luego entre oe-web y oe-build).
+ * completo. Matcher condicional y barato: solo se adjunta el bloque de código
+ * como texto cuando dispara.
  */
 export function shouldAttachBuilderDirective(message: string): boolean {
   const t = normalize(message)
@@ -65,10 +66,4 @@ export function shouldAttachBuilderDirective(message: string): boolean {
   // "build/create/construye..." explícito, o un verbo de construcción cerca del sustantivo.
   if (/\b(build|create|crea|hazme|construye|generame|desarrolla)\b/.test(t) && APP_NOUNS.test(t)) return true
   return BUILD_VERBS.test(t) && APP_NOUNS.test(t)
-}
-
-/** Palabras que indican SITIO WEB profesional (para preferir oe-web sobre oe-build). */
-export function looksLikeWebsiteRequest(message: string): boolean {
-  const t = normalize(message)
-  return /\b(web|sitio web|landing|pagina web|multi ?pagina|secciones|portafolio|agencia|clinica|restaurante|hotel|tienda online|corporativo)\b/.test(t)
 }

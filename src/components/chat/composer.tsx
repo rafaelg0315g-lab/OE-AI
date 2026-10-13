@@ -484,7 +484,7 @@ export function Composer({ variant = 'docked' }: { variant?: 'hero' | 'docked' }
                 <kbd className="ml-auto rounded border border-border/60 bg-secondary/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">/buscar</kbd>
               </button>
               <div aria-hidden className="mx-2 my-1 border-t border-border/50" />
-              {/* OE AI Web Factory: biblioteca y generacion de webs profesionales */}
+              {/* OE AI Web Factory: EN CONSTRUCCIÓN (el dialogo lo comunica) */}
               <button
                 type="button"
                 onClick={() => {
@@ -495,6 +495,7 @@ export function Composer({ variant = 'docked' }: { variant?: 'hero' | 'docked' }
               >
                 <Boxes className="size-4 text-emerald-300" aria-hidden />
                 Web Factory (sitios web)
+                <span className="ml-auto shrink-0 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300">Pronto</span>
               </button>
               {/* Herramientas IA (Task 19-e) */}
               <button
@@ -583,7 +584,7 @@ export function Composer({ variant = 'docked' }: { variant?: 'hero' | 'docked' }
                 <Boxes className="size-4 text-emerald-300" aria-hidden />
                 Construir una app en el chat
                 <span className="ml-auto shrink-0 rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300">
-                  ZIP
+                  VS Code
                 </span>
               </button>
             </PopoverContent>

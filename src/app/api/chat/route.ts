@@ -9,7 +9,7 @@ import { latestChecks } from '@/lib/ai/health'
 import { ProviderError, type ChatRequestMessage, type NormalizedCompletion, type ProductCategory, type RoutableRoute } from '@/lib/ai/types'
 import { buildSearchContext, searchWeb } from '@/lib/ai/tools/web-search'
 import { CAPACITY_SYSTEM_BLOCK, shouldAttachCapacityDoc } from '@/lib/ai/capacity-doc'
-import { BUILDER_SYSTEM_BLOCK, shouldAttachBuilderDirective } from '@/lib/ai/builder-directive'
+import { CODE_AS_TEXT_SYSTEM_BLOCK, shouldAttachBuilderDirective } from '@/lib/ai/builder-directive'
 import { consumeGuestChat, guestCookieHeader, resolveChatIdentity } from '@/lib/auth/guest'
 import {
   GEMINI_DIRECT_ROUTE,
@@ -713,15 +713,15 @@ export async function POST(request: Request) {
     if (galleryTurn) {
       systemContent = `${systemContent}\n\nGALERÍA DE LA WEB OBLIGATORIA: el usuario pidió ver imágenes reales sobre "${galleryTurn.subject}". Tu respuesta DEBE incluir exactamente UN bloque :::gallery con 3-4 filas en este formato EXACTO:\n- Título breve | Frase que explica qué muestra la imagen y por qué importa. | consulta de busqueda en ingles\nLas consultas (tercer campo) van EN INGLÉS, 3-5 palabras, descriptivas y fotográficas, y cada una cubre un ángulo distinto del tema. Añade además un párrafo de introducción y comentarios en markdown sobre lo que se ve; las imágenes NO las inventas tú: las busca la plataforma.`
     }
-    // Constructor de apps: la directiva ```oe-build se emite solo cuando el
-    // usuario pide construir/crear una app completa (no para dudas de código,
-    // y nunca en modo voz: la respuesta se lee en alta voz).
+    // Constructor de apps EN CONSTRUCCIÓN: cuando el usuario pide crear una web
+    // o una app, el asistente escribe el código COMO TEXTO del chat (archivo por
+    // archivo + pasos para VS Code/Cursor). Nunca en modo voz (se lee en alta voz).
     if (!body.voice && shouldAttachBuilderDirective(body.message)) {
       const bc = body.buildContext as { projectId?: string; title?: string; files?: string[]; kind?: string } | undefined
       const projectNote = bc?.projectId
-        ? `\nProyecto construido recientemente en esta conversación: id="${bc.projectId}" ("${bc.title ?? ''}"), tipo: ${bc.kind === 'web' ? 'sitio web (Web Factory)' : 'app (Constructor)'}, archivos: ${(bc.files ?? []).join(', ')}. Si la petición del usuario es un cambio, ajuste o mejora de ESE proyecto (estilo, colores, secciones, hero, textos), es OBLIGATORIO tratarla como MODIFICACIÓN: emite la directiva del mismo tipo (${bc.kind === 'web' ? 'oe-web' : 'oe-build'}) incluyendo "projectId":"${bc.projectId}", sin escribir código inline. Si pide algo totalmente nuevo, omite projectId.`
+        ? `\nProyecto entregado antes en esta conversación (modo texto): "${bc.title ?? ''}", tipo: ${bc.kind === 'web' ? 'sitio web' : 'app'}, archivos: ${(bc.files ?? []).join(', ')}. Si la petición del usuario es un cambio, ajuste o mejora de ESE proyecto (estilo, colores, secciones, textos), aplica la regla 6 del bloque anterior: muestra SOLO los archivos que cambian (completos, listos para reemplazar) manteniendo el mismo stack y estilo. Si pide algo totalmente nuevo, trata todo desde cero.`
         : ''
-      systemContent = `${systemContent}\n\n${BUILDER_SYSTEM_BLOCK}${projectNote}`
+      systemContent = `${systemContent}\n\n${CODE_AS_TEXT_SYSTEM_BLOCK}${projectNote}`
     }
     systemMessages.push({ role: 'system' as const, content: systemContent })
     // Modo voz (Voz ➡️ Texto ➡️ IA ➡️ Voz): español garantizado y estilo hablado.
@@ -751,7 +751,11 @@ export async function POST(request: Request) {
     },
   })
 
-  // 6) Stream SSE: meta → delta (respuesta completa, sin streaming de tokens no verificado) → done | error
+  // 6) Stream SSE: meta → delta (streaming real verificado; respaldo single-shot) → done | error
+  // Latido anti-idle: durante pausas largas del proveedor (respuestas únicas de
+  // 60s+, trabajo previo a tokens) se emite event:ping cada 7s para que proxy/CDN
+  // no corten la conexión y el usuario no vea el chat "congelado". El cliente
+  // ignora los eventos ping desconocidos.
   const encoder = new TextEncoder()
   const abortController = new AbortController()
   request.signal.addEventListener('abort', () => abortController.abort())
@@ -784,6 +788,8 @@ export async function POST(request: Request) {
         // Etiqueta amigable del núcleo activo para la interfaz premium.
         coreLabel: adapter.label.split(' (')[0],
       })
+
+      const heartbeat = setInterval(() => send('ping', { t: Date.now() }), 7000)
 
       try {
         // Búsqueda web real (opcional): fuentes normalizadas + contexto para el modelo.
@@ -968,6 +974,7 @@ export async function POST(request: Request) {
         })
         send('error', { message: safeMessage, errorType, requestId })
       } finally {
+        clearInterval(heartbeat)
         controller.close()
       }
     },

@@ -23,6 +23,7 @@ import {
   type NormalizedCompletion,
   type RoutableRoute,
 } from './types'
+import { MAX_ASSISTANT_CONTENT_CHARS } from './types-helpers'
 import type { WebSource } from './tools/web-search'
 
 const BASE = 'https://generativelanguage.googleapis.com/v1beta/models'
@@ -36,7 +37,7 @@ const GEMINI_IMAGE_MODELS = (
   process.env.GEMINI_IMAGE_MODEL ? [process.env.GEMINI_IMAGE_MODEL] : ['gemini-2.5-flash-image', 'gemini-3-pro-image-preview']
 ) as string[]
 
-const CHAT_TIMEOUT_MS = 90_000
+const CHAT_TIMEOUT_MS = 150_000 // respuestas de código largas (16k tokens de salida) tardan >90s
 const IMAGE_TIMEOUT_MS = 90_000
 const SEARCH_TIMEOUT_MS = 25_000
 
@@ -166,7 +167,7 @@ export async function geminiChatDirect(options: AdapterChatOptions): Promise<Nor
   if (!text) {
     throw new ProviderError(`Gemini devolvió respuesta vacía (${data.candidates?.[0]?.finishReason ?? 'sin candidato'}).`, 'empty_response')
   }
-  const content = text.slice(0, 24000)
+  const content = text.slice(0, MAX_ASSISTANT_CONTENT_CHARS)
   return {
     content,
     providerReportedModel: GEMINI_DIRECT_CHAT_MODEL,

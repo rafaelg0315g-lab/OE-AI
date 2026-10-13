@@ -10,7 +10,8 @@
  * - "Descargar todo" empaqueta el proyecto completo en un .zip (servidor).
  * - Webs de Web Factory: botón "Vista previa" (escritorio/tablet/móvil con
  *   iframe real), procedencia y resumen de validación.
- * - Bloques ```oe-build/```oe-web aún no resueltos se muestran como estado.
+ * - Bloques ```oe-build/```oe-web residuales muestran la tarjeta "En construcción"
+ *   (el entorno .zip está desactivado: el código se entrega como texto del chat).
  */
 import { useMemo, useState } from 'react'
 import { motion } from 'framer-motion'
@@ -24,6 +25,7 @@ import {
   FileCode,
   FileText,
   Globe,
+  HardHat,
   Image as ImageIcon,
   Info,
   Monitor,
@@ -408,29 +410,23 @@ export function ProjectFilesBlock({ data }: { data: ProjectFilesData }) {
   )
 }
 
-/** Estado inline de una directiva ```oe-build/```oe-web aún no resuelta (durante el stream). */
+/** Tarjeta "En construcción" de una directiva ```oe-build/```oe-web residual (entorno .zip desactivado). */
 export function BuildDirectivePending() {
   return (
     <div
       role="status"
-      aria-label="Preparando la construcción"
-      className="oe-shimmer my-3 flex w-full max-w-md items-center gap-2.5 rounded-xl border border-border/60 bg-secondary/40 px-4 py-3 text-sm text-muted-foreground"
+      aria-label="Constructor automático en construcción"
+      className="my-3 flex w-full max-w-md items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3.5"
     >
-      <motion.span
-        aria-hidden
-        className="flex gap-1"
-        transition={{ staggerChildren: 0.15 }}
-      >
-        {[0, 1, 2].map((i) => (
-          <motion.span
-            key={i}
-            className="size-1.5 rounded-full bg-emerald-400/80"
-            animate={{ y: [0, -4, 0], opacity: [0.5, 1, 0.5] }}
-            transition={{ duration: 0.9, repeat: Infinity, delay: i * 0.15 }}
-          />
-        ))}
-      </motion.span>
-      Preparando la construcción…
+      <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-amber-500/30 bg-amber-500/15" aria-hidden>
+        <HardHat className="size-[18px] text-amber-300" />
+      </span>
+      <span className="min-w-0">
+        <span className="block text-[13px] font-semibold leading-snug text-amber-200">Constructor automático en construcción</span>
+        <span className="mt-1 block text-[12px] leading-relaxed text-muted-foreground">
+          Mientras el entorno .zip se termina, OE AI entrega el código aquí en el chat: archivo por archivo, con los pasos para abrirlo en VS Code o Cursor.
+        </span>
+      </span>
     </div>
   )
 }

@@ -24,6 +24,7 @@ import {
   type NormalizedCompletion,
   type RoutableRoute,
 } from '../types'
+import { MAX_ASSISTANT_CONTENT_CHARS } from '../types-helpers'
 import type { EnabledModelRoute } from '../config'
 
 export interface OpenAICompatibleProviderDef {
@@ -144,7 +145,7 @@ export function createOpenAICompatibleAdapter(
       if (!content.trim()) {
         throw new ProviderError(`El proveedor ${def.label} devolvió una respuesta vacía.`, 'empty_response')
       }
-      const text = content.slice(0, 24000)
+      const text = content.slice(0, MAX_ASSISTANT_CONTENT_CHARS)
       return {
         content: text,
         providerReportedModel: typeof data.model === 'string' ? data.model : null,
@@ -223,7 +224,7 @@ export function createOpenAICompatibleAdapter(
                     const delta = json.choices?.[0]?.delta?.content
                     if (typeof delta === 'string' && delta.length > 0) {
                       accumulated += delta
-                      if (accumulated.length <= 24000) {
+                      if (accumulated.length <= MAX_ASSISTANT_CONTENT_CHARS) {
                         yield { delta }
                       }
                     }
@@ -241,7 +242,7 @@ export function createOpenAICompatibleAdapter(
                 'empty_response',
               )
             }
-            const content = accumulated.slice(0, 24000)
+            const content = accumulated.slice(0, MAX_ASSISTANT_CONTENT_CHARS)
             return {
               content,
               providerReportedModel: reportedModel,
