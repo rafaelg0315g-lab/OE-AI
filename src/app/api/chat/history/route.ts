@@ -48,6 +48,7 @@ export async function GET(request: Request) {
       assetId: true,
       attachmentAssetId: true,
       sourcesJson: true,
+      buildJson: true,
       requestedModelId: true,
       resolvedModelId: true,
       providerId: true,

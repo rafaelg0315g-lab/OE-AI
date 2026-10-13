@@ -17,6 +17,7 @@ import {
   geminiSearchWeb,
 } from '@/lib/ai/gemini-direct'
 import { detectGalleryIntent, detectMediaIntent } from '@/lib/ai/image-intent'
+import { buildImagePrompt } from '@/lib/ai/image-prompt'
 import { generateImageWithCascade } from '@/lib/ai/image-cascade'
 import { generateSvgCode } from '@/lib/ai/svg-generator'
 
@@ -340,8 +341,8 @@ export async function POST(request: Request) {
           routeNote: isSvg
             ? 'Pediste SVG: se diseña código vectorial real que puedes descargar y escalar sin límite.'
             : mediaIntent.format === 'icon'
-              ? 'Detecté un icono: lo genero como PNG con estilo de icono (es lo ideal para iconos).'
-              : 'Detecté una petición de imagen: la genero con el núcleo de medios.',
+              ? 'Detecté un icono: lo genero como PNG con estilo de icono (es lo ideal para iconos), con contexto de nuestra conversación y referencias web si aplica.'
+              : 'Detecté una petición de imagen: la genero con el núcleo de medios, con contexto de la conversación y referencias de la web si aplica.',
           fallbackUsed: false,
           streaming: false,
           sessionId: body.sessionId,
@@ -358,8 +359,24 @@ export async function POST(request: Request) {
 
         try {
           if (isSvg) {
-            send('stage', { stage: 'svg_design' })
-            const svg = await generateSvgCode(mediaIntent.prompt)
+            send('stage', { stage: 'svg_design', note: 'Diseñando el vector…', elapsed: 0 })
+            // Latido para SVG también: el diseño puede tardar más de 30 s.
+            const svgNotes = ['Definiendo formas y trazos…', 'Ajustando curvas y color…', 'Puliendo el vector…']
+            let svgIdx = 0
+            const svgHeartbeat = setInterval(() => {
+              send('stage', {
+                stage: 'svg_design',
+                note: svgNotes[Math.min(svgIdx, svgNotes.length - 1)],
+                elapsed: Math.round((Date.now() - startedAt) / 1000),
+              })
+              svgIdx += 1
+            }, 8_000)
+            let svg
+            try {
+              svg = await generateSvgCode(mediaIntent.prompt)
+            } finally {
+              clearInterval(svgHeartbeat)
+            }
             const content = `:::svg\n${svg.code}\n:::`
             const assistant = await db.chatMessage.create({
               data: {
@@ -397,8 +414,64 @@ export async function POST(request: Request) {
               docRead: false,
             })
           } else {
-            send('stage', { stage: 'image' })
-            const outcome = await generateImageWithCascade({ prompt: mediaIntent.prompt, size: mediaIntent.size })
+            send('stage', { stage: 'image', note: 'Analizando tu petición…', elapsed: 0 })
+
+            // Contexto de la conversación (para "genera una imagen DEL TEMA") y
+            // referencias web reales (marcas, lugares, "lo que esté en la web").
+            let recentTurns: Array<{ role: 'user' | 'assistant'; content: string }> = []
+            try {
+              const rows = await db.chatMessage.findMany({
+                where: { sessionId: body.sessionId },
+                orderBy: { createdAt: 'desc' },
+                take: 7,
+                select: { role: true, content: true },
+              })
+              recentTurns = rows
+                .filter((r) => r.content !== body.message)
+                .reverse()
+                .map((r) => ({ role: r.role as 'user' | 'assistant', content: r.content }))
+            } catch {
+              // Sin contexto: el prompt base del intent es suficiente.
+            }
+            const enriched = await buildImagePrompt({
+              intent: mediaIntent,
+              userMessage: body.message,
+              recentTurns,
+            })
+            if (enriched.webGrounded) {
+              send('stage', {
+                stage: 'image',
+                note: 'Consultando referencias de la web…',
+                elapsed: Math.round((Date.now() - startedAt) / 1000),
+              })
+            }
+
+            // Latido SSE: notas de progreso periódicas mientras los proveedores
+            // pintan (mantiene viva la conexión y alimenta la animación aurora).
+            const genStartedAt = Date.now()
+            const progressNotes = [
+              'Componiendo la escena…',
+              'Pintando los detalles…',
+              'Dando los toques finales…',
+              'Afinando la luz y el color…',
+              'Casi lista…',
+            ]
+            let noteIdx = 0
+            const heartbeat = setInterval(() => {
+              send('stage', {
+                stage: 'image',
+                note: progressNotes[Math.min(noteIdx, progressNotes.length - 1)],
+                elapsed: Math.round((Date.now() - genStartedAt) / 1000),
+              })
+              noteIdx += 1
+            }, 7_000)
+
+            let outcome
+            try {
+              outcome = await generateImageWithCascade({ prompt: enriched.prompt, size: mediaIntent.size })
+            } finally {
+              clearInterval(heartbeat)
+            }
             const asset = await db.generatedAsset.create({
               data: {
                 sessionId: body.sessionId,
@@ -448,7 +521,7 @@ export async function POST(request: Request) {
               providerReportedModel: outcome.reportedModel,
               providerId: outcome.providerId,
               fallbackUsed: false,
-              webSearchUsed: false,
+              webSearchUsed: enriched.webGrounded,
               visionUsed: false,
               docRead: false,
             })

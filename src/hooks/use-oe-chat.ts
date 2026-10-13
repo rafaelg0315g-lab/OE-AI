@@ -39,6 +39,47 @@ export interface ChatMsgMeta {
   streaming?: boolean
 }
 
+/* ── Constructor de apps EN VIVO (SSE /api/tools/build-stream) ─────────── */
+
+/** Tarea visible del panel de construcción (estilo lista de todos). */
+export interface BuildLiveTodo {
+  id: string
+  label: string
+  status: 'pending' | 'active' | 'done' | 'failed'
+}
+
+/** Archivo generado: disponible (y descargable) en cuanto el pipeline lo emite. */
+export interface BuildLiveFile {
+  path: string
+  language: string
+  bytes: number
+  /** Contenido completo para el visor de código en vivo. */
+  content?: string
+  /** Descarga individual: /api/tools/build-app/[id]/download?path=… */
+  url?: string
+}
+
+/** Snapshot del panel de construcción que vive dentro del mensaje. */
+export interface BuildLiveSnapshot {
+  kind: 'app' | 'web'
+  status: 'building' | 'ready' | 'error'
+  projectId?: string | null
+  title?: string | null
+  summary?: string | null
+  todos: BuildLiveTodo[]
+  files: BuildLiveFile[]
+  /** Nota de etapa enviada por el servidor. */
+  note?: string | null
+  /** Descarga del proyecto completo (.zip) — solo cuando status=ready. */
+  zipUrl?: string | null
+  /** Vista previa iframe (sitios HTML estáticos del Web Factory). */
+  previewUrl?: string | null
+  isUpdate?: boolean
+  changedPaths?: string[]
+  latencyMs?: number | null
+  error?: string | null
+}
+
 export interface ChatMsg {
   id: string
   role: 'user' | 'assistant'
@@ -55,6 +96,10 @@ export interface ChatMsg {
   assetUrl?: string | null
   /** Placeholder mientras se genera la imagen. */
   pendingImage?: boolean
+  /** Etapa en vivo de la generación de imagen (SSE stage → animación aurora). */
+  imageStage?: { note: string; elapsed: number } | null
+  /** Constructor en vivo: tareas, código y descargas streaming. */
+  build?: BuildLiveSnapshot | null
   /** true: placeholder aurora mientras se genera un video narrado. */
   pendingVideo?: boolean
   /** true: el constructor de apps está generando la app (aurora de puntos). */
@@ -679,6 +724,18 @@ export function useOeChat(options?: { initialChatId?: string }) {
             // JSON inválido: se ignora
           }
         }
+        // Snapshot del constructor en vivo (nuevos builds): reconstruye el panel.
+        let build: BuildLiveSnapshot | null = null
+        if (typeof m.buildJson === 'string' && m.buildJson) {
+          try {
+            const parsed = JSON.parse(m.buildJson) as BuildLiveSnapshot
+            if (parsed && typeof parsed === 'object' && Array.isArray(parsed.todos) && Array.isArray(parsed.files)) {
+              build = { ...parsed, status: parsed.status === 'building' ? 'ready' : parsed.status }
+            }
+          } catch {
+            // JSON inválido: se ignora
+          }
+        }
         return {
           id: String(m.id),
           role,
@@ -689,6 +746,7 @@ export function useOeChat(options?: { initialChatId?: string }) {
           assetUrl: kind === 'image' && typeof m.assetId === 'string' ? `/api/assets/${m.assetId}` : null,
           attachmentUrl: role === 'user' && typeof m.attachmentAssetId === 'string' ? `/api/assets/${m.attachmentAssetId}` : null,
           sources,
+          build,
           createdAt: typeof m.createdAt === 'string' ? m.createdAt : null,
           meta: {
             providerReportedModel: (m.providerReportedModel as string) ?? null,
@@ -703,6 +761,16 @@ export function useOeChat(options?: { initialChatId?: string }) {
       syncUrlTo(id)
       // Continuidad del constructor: el último proyecto construido de ESTA conversación.
       lastBuildRef.current = extractLastBuildFromHistory(restored.map((m) => ({ content: m.fullContent })))
+      // Builds nuevos: el snapshot vive en buildJson (prioridad sobre el bloque oeproject).
+      const lastBuilt = [...restored].reverse().find((m) => m.build?.projectId)
+      if (lastBuilt?.build?.projectId) {
+        lastBuildRef.current = {
+          projectId: lastBuilt.build.projectId,
+          title: lastBuilt.build.title ?? 'App construida',
+          files: lastBuilt.build.files.map((f) => f.path).slice(0, 12),
+          kind: lastBuilt.build.kind,
+        }
+      }
       // Recuperación: directivas/notas de build sin resolver → estado real del servidor.
       void healUnresolvedBuilds(id, restored)
       try {
@@ -834,16 +902,34 @@ export function useOeChat(options?: { initialChatId?: string }) {
       const isWeb = directive.kind === 'web'
       const waiting = prefix || (isWeb ? 'Diseñando tu sitio web…' : 'Construyendo tu app…')
       const startedAt = Date.now()
+
+      // Snapshot local del build en vivo (fuente única para el estado Y la persistencia).
+      let snapshot: BuildLiveSnapshot = {
+        kind: directive.kind,
+        status: 'building',
+        todos: [{ id: 'plan', label: isWeb ? 'Planear el sitio' : 'Planear la arquitectura', status: 'active' }],
+        files: [],
+        note: null,
+        isUpdate: Boolean(directive.projectId),
+      }
+      const applySnapshot = (next: BuildLiveSnapshot) => {
+        snapshot = next
+        setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, build: next } : m)))
+      }
+      const patchBuild = (patch: Partial<BuildLiveSnapshot>) => applySnapshot({ ...snapshot, ...patch })
+
       setMessages((prev) =>
         prev.map((m) =>
           m.id === assistantId
-            ? { ...m, content: waiting, fullContent: waiting, pendingProject: true, complete: true }
+            ? { ...m, content: waiting, fullContent: waiting, pendingProject: true, complete: true, build: snapshot }
             : m,
         ),
       )
       try {
         const token = await auth.getAccessToken()
-        const res = await fetch(isWeb ? '/api/web-factory/generate' : '/api/tools/build-app', {
+        // STREAMING: el endpoint emite tareas, notas y cada archivo COMPLETO en
+        // cuanto está listo (persistido temprano en servidor → descargable ya).
+        const res = await fetch('/api/tools/build-stream', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -852,65 +938,174 @@ export function useOeChat(options?: { initialChatId?: string }) {
           body: JSON.stringify({
             sessionId: convId,
             brief: directive.brief,
+            kind: directive.kind,
             mode: directive.mode,
             projectId: directive.projectId,
           }),
         })
-        const data = (await res.json().catch(() => null)) as {
-          id?: string
-          title?: string
-          summary?: string
-          mode?: string
-          stack?: string
-          isUpdate?: boolean
-          changedPaths?: string[]
-          files?: Array<{ path: string; language: string; bytes: number }>
-          latencyMs?: number
-          error?: string
-          errorType?: string
-          // Campos extra de Web Factory (vista previa, diseño, procedencia, validación)
-          previewUrl?: string
-          designSystem?: Record<string, string>
-          references?: Array<{ name: string; repoUrl: string; license: string; usage: string }>
-          checks?: Array<{ check: string; status: string; detail: string }>
-          warnings?: string[]
-        } | null
-        if (!res.ok || !data?.id) {
-          throw Object.assign(new Error(data?.error ?? `No se pudo construir la app (error ${res.status}).`), {
+        if (!res.ok || !res.body) {
+          const data = (await res.json().catch(() => null)) as { error?: string; errorType?: string } | null
+          throw Object.assign(new Error(data?.error ?? `No se pudo iniciar la construcción (error ${res.status}).`), {
             errorType: data?.errorType,
           })
         }
-        const newContent = oeProjectContent(prefix, data, isWeb)
+
+        // Lector SSE (mismo protocolo que /api/chat).
+        type BuildDonePayload = {
+          id?: string
+          title?: string
+          summary?: string
+          isUpdate?: boolean
+          changedPaths?: string[]
+          stack?: string
+          framework?: string
+          files?: Array<{ path: string; language: string; bytes: number; url?: string }>
+          zipUrl?: string
+          previewUrl?: string
+          latencyMs?: number
+        }
+        const reader = res.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        // Estado del stream en un contenedor (evita el narrowing de closures de TS).
+        const streamState: {
+          done: BuildDonePayload | null
+          error: { message: string; errorType?: string } | null
+        } = { done: null, error: null }
+
+        const handleEvent = (event: string, raw: string) => {
+          let data: Record<string, unknown>
+          try {
+            data = JSON.parse(raw) as Record<string, unknown>
+          } catch {
+            return
+          }
+          if (event === 'build_meta') {
+            patchBuild({ title: (data.title as string) || snapshot.title, summary: (data.summary as string) || snapshot.summary })
+          } else if (event === 'todos') {
+            const items = Array.isArray(data.items) ? (data.items as Array<{ id: string; label: string; status: string }>) : []
+            patchBuild({
+              todos: items.map((t) => ({
+                id: String(t.id),
+                label: String(t.label),
+                status: (['pending', 'active', 'done', 'failed'] as const).includes(t.status as BuildLiveTodo['status'])
+                  ? (t.status as BuildLiveTodo['status'])
+                  : 'pending',
+              })),
+            })
+          } else if (event === 'todo') {
+            patchBuild({
+              todos: snapshot.todos.map((t) =>
+                t.id === data.id ? { ...t, status: (['pending', 'active', 'done', 'failed'] as const).includes(data.status as BuildLiveTodo['status']) ? (data.status as BuildLiveTodo['status']) : t.status } : t,
+              ),
+            })
+          } else if (event === 'note') {
+            patchBuild({ note: (data.note as string) ?? null })
+          } else if (event === 'file') {
+            const file: BuildLiveFile = {
+              path: String(data.path ?? ''),
+              language: String(data.language ?? 'text'),
+              bytes: Number(data.bytes ?? 0),
+              content: typeof data.content === 'string' ? data.content : undefined,
+              url: typeof data.url === 'string' ? data.url : undefined,
+            }
+            if (!file.path) return
+            const exists = snapshot.files.some((f) => f.path === file.path)
+            patchBuild({
+              files: exists ? snapshot.files.map((f) => (f.path === file.path ? { ...f, ...file } : f)) : [...snapshot.files, file],
+            })
+          } else if (event === 'done') {
+            streamState.done = data as BuildDonePayload
+          } else if (event === 'error') {
+            streamState.error = { message: String(data.message ?? 'La construcción falló.'), errorType: data.errorType as string | undefined }
+          }
+        }
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const parts = buffer.split('\n\n')
+          buffer = parts.pop() ?? ''
+          for (const part of parts) {
+            let evtName = ''
+            let dataLine = ''
+            for (const line of part.split('\n')) {
+              if (line.startsWith('event:')) evtName = line.slice(6).trim()
+              else if (line.startsWith('data:')) dataLine += line.slice(5).trim()
+            }
+            if (evtName && dataLine) handleEvent(evtName, dataLine)
+          }
+        }
+
+        if (streamState.error) {
+          throw Object.assign(new Error(streamState.error.message), { errorType: streamState.error.errorType })
+        }
+        if (!streamState.done) {
+          throw new Error('La conexión de construcción se cerró antes de terminar.')
+        }
+
+        const done = streamState.done
+        const doneFiles: BuildLiveFile[] = (done.files ?? []).map((f) => ({
+          path: f.path,
+          language: f.language,
+          bytes: f.bytes,
+          url:
+            f.url ??
+            (done.id ? `/api/tools/build-app/${done.id}/download?path=${encodeURIComponent(f.path)}` : undefined),
+          content: snapshot.files.find((x) => x.path === f.path)?.content,
+        }))
+        applySnapshot({
+          ...snapshot,
+          status: 'ready',
+          projectId: done.id ?? snapshot.projectId ?? null,
+          title: done.title || snapshot.title,
+          summary: done.summary || snapshot.summary,
+          todos: snapshot.todos.map((t) => (t.status === 'active' ? { ...t, status: 'done' as const } : t)),
+          files: doneFiles,
+          note: null,
+          zipUrl: done.zipUrl ?? null,
+          previewUrl: done.previewUrl ?? null,
+          isUpdate: done.isUpdate ?? snapshot.isUpdate,
+          changedPaths: done.changedPaths ?? [],
+          latencyMs: done.latencyMs ?? null,
+        })
+
+        // Persistencia: el contenido queda como anuncio del modelo; el snapshot
+        // del panel vive en buildJson (el bloque oeproject solo en builds viejos).
+        const finalContent = prefix || (isWeb ? 'Tu sitio web está listo. 🎉' : 'Tu app está lista. 🎉')
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
               ? {
                   ...m,
-                  content: newContent,
-                  fullContent: newContent,
+                  content: finalContent,
+                  fullContent: finalContent,
                   pendingProject: false,
                   complete: true,
-                  meta: { ...m.meta, latencyMs: data.latencyMs ?? m.meta?.latencyMs ?? null },
+                  meta: { ...m.meta, latencyMs: done.latencyMs ?? m.meta?.latencyMs ?? null },
                 }
               : m,
           ),
         )
-        // Persistir el mensaje actualizado (directiva → tarjetas) para el historial.
-        // Sin servidorMessageId (invitado demo, chat efímero): solo vista local.
         if (serverMessageId) {
           void (async () => {
             const headers = { 'Content-Type': 'application/json', ...(await authHeaders()) }
             await fetch('/api/chat/messages', {
               method: 'PATCH',
               headers,
-              body: JSON.stringify({ id: serverMessageId, content: newContent }),
+              body: JSON.stringify({
+                id: serverMessageId,
+                content: finalContent,
+                buildJson: JSON.stringify({ ...snapshot, status: 'ready' }),
+              }),
             }).catch(() => undefined)
           })()
         }
         lastBuildRef.current = {
-          projectId: data.id,
-          title: data.title ?? 'App construida',
-          files: (data.files ?? []).map((f) => f.path).slice(0, 12),
+          projectId: done.id ?? '',
+          title: done.title ?? 'App construida',
+          files: (done.files ?? []).map((f) => f.path).slice(0, 12),
           kind: isWeb ? 'web' : 'app',
         }
         void refreshQuota()
@@ -922,7 +1117,14 @@ export function useOeChat(options?: { initialChatId?: string }) {
           setMessages((prev) =>
             prev.map((m) =>
               m.id === assistantId
-                ? { ...m, content: note, fullContent: note, pendingProject: false, complete: true }
+                ? {
+                    ...m,
+                    content: note,
+                    fullContent: note,
+                    pendingProject: false,
+                    complete: true,
+                    build: m.build ? { ...m.build, status: 'error', error: message } : m.build,
+                  }
                 : m,
             ),
           )
@@ -944,15 +1146,14 @@ export function useOeChat(options?: { initialChatId?: string }) {
           return
         }
         if (e.errorType) {
-          // Error estructurado del propio endpoint: el pipeline ya terminó en
-          // error en el servidor (fallo definitivo, nada que recuperar).
+          // Error estructurado del endpoint de streaming: el pipeline ya terminó
+          // en error en el servidor (fallo definitivo, nada que recuperar).
           noteError(`⚠️ No se pudo construir la ${isWeb ? 'web' : 'app'}: ${e.message}`)
           return
         }
         // Sin errorType: la conexión se cortó antes de la respuesta (502 del
         // gateway, red, recarga). El build puede seguir en el servidor: se
-        // sondea el estado real y las tarjetas aparecen solas al terminar,
-        // SIN recargar la página.
+        // sondea el estado real y el panel se resuelve solo al terminar.
         await resolveBuildByStatus({
           convId,
           assistantId,
@@ -1075,8 +1276,18 @@ export function useOeChat(options?: { initialChatId?: string }) {
             ),
           )
         } else if (event === 'stage') {
-          const { stage } = data as { stage?: string }
-          if (stage === 'web_search') setWebSearching(true)
+          const d = data as { stage?: string; note?: string; elapsed?: number }
+          if (d.stage === 'web_search') setWebSearching(true)
+          else if ((d.stage === 'image' || d.stage === 'svg_design') && d.note) {
+            // Etapa en vivo de la generación de medios: alimenta la animación.
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId
+                  ? { ...m, imageStage: { note: d.note ?? '', elapsed: typeof d.elapsed === 'number' ? d.elapsed : 0 } }
+                  : m,
+              ),
+            )
+          }
         } else if (event === 'search') {
           const { sources } = data as { sources?: WebSource[] }
           setWebSearching(false)

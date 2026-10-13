@@ -20,7 +20,6 @@ import {
   Download,
   Eye,
   Globe,
-  ImagePlus,
   Lightbulb,
   ListPlus,
   Pencil,
@@ -38,6 +37,8 @@ import { useChat } from './chat-context'
 import type { ChatMsg } from '@/hooks/use-oe-chat'
 import { CanvasPanel } from './canvas-panel'
 import { BuildPendingPlaceholder } from './build-pending-placeholder'
+import { BuildLivePanel } from './build-live-panel'
+import { ImagePendingPlaceholder } from './image-pending-placeholder'
 import { Markdown } from './markdown'
 import { OeLogo } from './oe-logo'
 import { VideoPendingPlaceholder } from './video-pending-placeholder'
@@ -414,16 +415,11 @@ function AssistantAvatar({ thinking }: { thinking: boolean }) {
 function AssistantContent({ msg, onOpenCanvas }: { msg: ChatMsg; onOpenCanvas: (code: string) => void }) {
   const chat = useChat()
 
-  // Estado "Pensando…" (esperando al proveedor)
+  // Placeholder "aurora nube" mientras se genera la imagen (etapas SSE + timer).
   if (msg.pendingImage) {
     return (
       <div className="w-full max-w-sm">
-        <div className="oe-shimmer flex aspect-square w-full items-center justify-center rounded-2xl border border-border/60 bg-secondary/40">
-          <div className="flex flex-col items-center gap-2 text-sm text-muted-foreground">
-            <ImagePlus className="size-6 text-emerald-300" aria-hidden />
-            <span>Generando imagen…</span>
-          </div>
-        </div>
+        <ImagePendingPlaceholder note={msg.imageStage?.note} elapsed={msg.imageStage?.elapsed} />
       </div>
     )
   }
@@ -437,7 +433,21 @@ function AssistantContent({ msg, onOpenCanvas }: { msg: ChatMsg; onOpenCanvas: (
     )
   }
 
-  // Constructor de apps: aurora de puntos mientras se generan los archivos.
+  // Constructor de apps EN VIVO: tareas marcándose + código streaming + descargas.
+  if (msg.build) {
+    return (
+      <div className="w-full">
+        {msg.content && (
+          <div className="mb-3 rounded-2xl rounded-tl-lg bg-secondary/50 px-4 py-3 ring-1 ring-border/50">
+            <Markdown content={msg.content} onOpenCanvas={onOpenCanvas} />
+          </div>
+        )}
+        <BuildLivePanel build={msg.build} />
+      </div>
+    )
+  }
+
+  // Constructor legacy (sin snapshot, p. ej. reanudado por sondeo): aurora.
   if (msg.pendingProject) {
     return (
       <div className="w-full">

@@ -45,6 +45,8 @@ model ChatMessage {
   attachmentAssetId     String?
   // Bloques estructurados del turno (JSON array de ChatBlock: genui/image/document/file/error)
   blocksJson            String?
+  // Resultado del constructor de apps en vivo (JSON: BuildLiveSnapshot con todos, archivos y descargas)
+  buildJson             String?
   // Fuentes web usadas (JSON: [{name,url,hostName,snippet,date}]) cuando hubo búsqueda web
   sourcesJson           String?
   // Trazabilidad de enrutamiento (sin contenido sensible)

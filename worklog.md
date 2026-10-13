@@ -693,3 +693,47 @@ Stage Summary:
 - SVG real: código vectorial descargable (.svg/.png) generado por LLM con preview seguro.
 - Commit 3de1e3f pusheado a main (Vercel despliega solo); sin env vars nuevas necesarias.
 - Deuda conocida: tsc baseline 22 errores preexistentes (route completion-asignación, Buffer/Bytes, web-factory) — no introducidos por esta tarea.
+---
+Task ID: 35
+Agent: Z.ai Code (main)
+Task: Chat visual estilo GPT/Claude — canvas con imágenes de la web, timeline de planes, cascada de letras y tipografía propia
+
+Work Log:
+- NEW src/lib/ai/image-search.ts: searchWebImages() sobre zai.images.search.create (SDK, sin CLI), URLs re-hosteadas en OSS (estables), caché en memoria 30 min (evicción LRU simple, máx 200), dedup de peticiones simultáneas y reintento con backoff 2.5s ante 429 del upstream.
+- NEW GET /api/tools/image-search?q&count (1-3): rate limit propio 24/min por IP (checkRateLimit), Cache-Control privado 300s, maxDuration 60.
+- src/lib/ai/image-intent.ts: NEW detectGalleryIntent() — verbos de búsqueda (busca/muéstrame/encuentra/tráeme…) + objetos imágenes/fotos; STRONG_CREATE_VERB (crea/genera/dibuja…) devuelve null → generación gana. Prioridad en route.ts: galleryTurn ANTES de mediaIntent ("muestrame imagenes de X" ya NO genera una imagen IA: ahora es búsqueda web).
+- /api/chat: baseSystem con RICH_FORMAT_RULE ampliado (3 bloques: :::plan, :::cards, :::gallery; máx 2 por respuesta; consultas de galería EN INGLÉS 3-5 palabras fotográficas; prohibido inventar URLs) + STYLE_RULE (respuestas desarrolladas: contexto/ejemplos/cierre con siguiente paso, tono cálido, 1-2 emojis; nada de respuestas de una línea salvo saludos). Turno de galería: directiva GALERÍA DE LA WEB OBLIGATORIA con subject detectado.
+- markdown.tsx: splitRichSegments ampliada a (cards|svg|plan|gallery); PlanBlock (timeline: círculos numerados esmeralda + conector vertical degradado, títulos oe-display); GalleryBlock/GalleryRow (tile 96-80px con esqueleto animate-pulse, img object-cover con hover zoom, fallback ImageIcon, número + título + descripción); parseGalleryRows descarta filas-URL (seguridad: las imágenes SIEMPRE las busca la plataforma); prop serif en Markdown/MarkdownSegment (prosa p/li/blockquote en .oe-serif-text, headings .oe-display).
+- use-oe-chat.ts: startTypewriter reescrita a CASCADA — ritmo 10ms/char (~100 c/s), suelo 1.1s, techo 7s, ease-out 1.55; skip intacto para ``` y tablas.
+- Tipografía: layout.tsx añade Space_Grotesk (--font-oe-grotesk) y Source_Serif_4 (--font-oe-serif); globals.css añade .oe-display y .oe-serif-text (15.5px/1.78).
+- message-list.tsx: <Markdown serif /> solo en render del asistente (burbujas de edición y previews quedan en Geist). welcome-screen.tsx: chip "Trae imágenes de la web".
+- FIX crítico en vivo: durante la cascada, GalleryRow disparaba 1 fetch POR LETRA (queries truncadas tipo "iceland northern li", tormenta de 429 del upstream y rate limit propio quemado) → debounce 700ms por fila (fetch solo cuando la fila lleva 700ms sin cambiar) + reintento server de 429. Tras el fix: exactamente 1 petición por fila con queries limpias en inglés.
+- Dev: caché stale de Turbopack impidió cargar el CSS nuevo (.next servía globals.css viejo tras Fast Refresh) → rm -rf .next + pm2 restart con export del pooler. Recordatorio: los errores "invalid at computed-value time" de var() no definidas hacen fallback silencioso a la fuente heredada.
+- Limpieza: 9 sesiones guest de test borradas de Supabase (24 mensajes, 4 assets).
+
+Stage Summary:
+- Verificado en navegador (desktop 1280px): turno "Buscame imagenes de auroras boreales sobre islandia" → galería con 4 tarjetas numeradas y fotos reales cargadas; turno torre Eiffel → 4 fotos (Trocadero/noche/Sena) con 4 peticiones limpias; turno plan de pan artesanal → timeline :::plan con fases + prosa serif larga; cascada capturada en vivo (texto cortado a mitad de frase con cursor). Sin errores de página.
+- Fuentes activas verificadas por computed style: Space Grotesk en .oe-display, Source Serif 4 en .oe-serif-text.
+- Commit 07baa53 pusheado a main (Vercel despliega solo); sin env vars nuevas.
+- Deuda menor: el núcleo z-ai a veces emite la descripción en español como consulta (la búsqueda igual devuelve resultados aceptables) y algún caracter chino suelto ("triángulo曝光") — quirks del modelo free, no del pipeline.
+
+---
+Task ID: 36
+Agent: Z.ai Code (principal)
+Task: Volver todo entorno de prueba de nuevo (sandbox reseteado: .env roto, PM2 desaparecido, servicios muertos) y dejar PM2 permanente/auto-arrancable.
+
+Work Log:
+- Diagnóstico: sandbox reseteado de nuevo. .env reducido a 1 línea (DATABASE_URL=file:...sqlite), binario pm2 desaparecido de PATH, los 3 servicios caídos, node_modules de mini-services/voice-service borrado (socket.io faltante).
+- .env restaurado completo (DATABASE_URL pooler Supabase, NEXT_PUBLIC_SUPABASE_*, GEMINI_*, JSON2VIDEO_API_KEY, OPENROUTER_API_KEY, OE_AI_MODEL_ROUTES) + chmod 600.
+- PM2 7.0.4 reinstalado (npm i -g pm2).
+- NEW ecosystem.config.js en la raíz: las 3 apps (oe-ai-dev :3000, oe-voice-ws :3010, oe-telegram-bot :3005) declaradas con cwd, args, out/err logs en /tmp, autorestart, restart_delay 3s, y ENV construida parseando .env vía fs (fuente única de verdad) → las variables sqlite heredadas de la shell ya NO pueden corromper los procesos (causa raíz de Task 33 eliminada).
+- Puertos 3000/3010/3005 verificados libres; pm2 start ecosystem.config.js → 3 procesos online.
+- pm2 startup systemd NO disponible (sudo pide contraseña, no hay crontab): alternativa sin root → pm2 save (dump en ~/.pm2/dump.pm2) + NEW scripts/restore-server.sh (reinstala pm2 si falta, repara .env si detecta sqlite, bun install de mini-servicios si falta node_modules, pm2 resurrect con fallback a ecosystem, pm2 save) + hook en ~/.bashrc que lanza el script en background al abrir CUALQUIER shell (primera shell tras un reset revive el servidor sola; log en /tmp/oe-restore.log).
+- oe-voice-ws: falló por 'Cannot find package socket.io' → bun install en mini-services/voice-service + pm2 restart → :3010 escuchando.
+- E2E: POST /api/chat {sessionId uuid, "hola bro", allowFallback} → SSE meta/delta/done OK (z-ai, 703ms, messageId persistido). dev.log con tráfico real 200 (auth/sync, chat/sessions, image-search). Caddy gateway vivo. pm2 save final.
+
+Stage Summary:
+- Entorno de prueba 100% restaurado: app :3000 (SSE chat verificado), voz :3010, telegram :3005.
+- PM2 ahora es permanente en la medida posible del sandbox: autorestart ante crashes, dump persistido y auto-revive vía hook de .bashrc + scripts/restore-server.sh (idempotente).
+- Si vuelve a morir: basta abrir una terminal (hook .bashrc) o ejecutar bash scripts/restore-server.sh.
+- Sin cambios en código de la app ni env vars nuevas para Vercel.

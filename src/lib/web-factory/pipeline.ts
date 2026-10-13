@@ -30,6 +30,7 @@
  * licencia queda registrada en la procedencia del proyecto.
  */
 import { buildChatJson } from '@/lib/build/llm'
+import { createProgressSink, type BuildProgressSink } from '@/lib/build/progress'
 import { db } from '@/lib/db'
 import { guessCategory, listComponentKinds, pickReferences, type CatalogTemplate } from './catalog'
 import { validateSite, type FactoryCheck } from './validate'
@@ -866,7 +867,13 @@ export async function runWebFactory(input: {
   sessionId: string
   existingProjectId?: string
   signal?: AbortSignal
+  /** Sink opcional de progreso en vivo (SSE del constructor). */
+  onProgress?: BuildProgressSink
 }): Promise<Omit<FactoryResult, 'id' | 'previewUrl' | 'latencyMs'> & { planJson: string; readme: string }> {
+  const progress = createProgressSink(input.onProgress)
+  const emitFile = (path: string, content: string) => {
+    progress({ type: 'file_done', path, language: languageFromPath(path), bytes: Buffer.byteLength(content, 'utf8'), content })
+  }
   const start = Date.now()
   const isUpdate = Boolean(input.existingProjectId)
 
@@ -884,6 +891,14 @@ export async function runWebFactory(input: {
   let plan: FactoryPlan
   if (!existing) {
     // 1) Plan con catálogo real (HyperUI + HugoBlox Kit + GitHub)
+    progress({ type: 'stage_note', note: 'Diseñando la estructura del sitio…' })
+    progress({ type: 'todos', items: [
+      { id: 'plan', label: 'Planear el sitio', status: 'active' },
+      { id: 'shell', label: 'Crear el diseño base (shell)', status: 'pending' },
+      { id: 'pages', label: 'Componer las páginas', status: 'pending' },
+      { id: 'validate', label: 'Validar y verificar', status: 'pending' },
+      { id: 'readme', label: 'Documentar y empaquetar', status: 'pending' },
+    ] })
     const [refs, componentKinds] = await Promise.all([pickReferences(input.brief), listComponentKinds()])
     const planStart = Date.now()
     const planRes = await buildChatJson<RawPlan>(
@@ -893,6 +908,8 @@ export async function runWebFactory(input: {
     )
     plan = parsePlan(planRes.data, refs)
     console.error(`[web-factory] plan ${((Date.now() - planStart) / 1000).toFixed(1)}s vía ${planRes.core} · ${plan.pages.length} páginas · framework ${plan.framework} · ${plan.references.length} referencias`)
+    progress({ type: 'title', title: plan.title, summary: plan.summary })
+    progress({ type: 'todo_update', id: 'plan', status: 'done' })
   } else {
     // Plan mínimo heredado del proyecto existente (para README/procedencia).
     const wasReact = existing.files.some((f) => f.path.startsWith('src/'))
@@ -919,6 +936,7 @@ export async function runWebFactory(input: {
 
   if (!existing) {
     // 2) Shell compartido (styles.css + app.js | components/site.tsx)
+    progress({ type: 'todo_update', id: 'shell', status: 'active' })
     const shellStart = Date.now()
     const shellKeys = plan.framework === 'react' ? { css: '', tsx: '' } : { css: '', js: '' }
     const shell = await buildChatJson<{ css?: unknown; js?: unknown; tsx?: unknown }>(
@@ -956,14 +974,18 @@ export async function runWebFactory(input: {
       ]
     }
     console.error(`[web-factory] shell ${((Date.now() - shellStart) / 1000).toFixed(1)}s vía ${shell.core} · css ${css.length}B · ${plan.framework}`)
+    for (const f of files) emitFile(f.path, f.content)
+    progress({ type: 'todo_update', id: 'shell', status: 'done' })
 
     // 3) Imágenes (best-effort, en paralelo)
+    if (plan.images.length > 0) progress({ type: 'stage_note', note: 'Generando imágenes IA para el sitio…' })
     images = await generatePlanImages(input.sessionId, plan.images)
 
     // 4) Páginas (comparten el shell → coherencia). Arranque escalonado para no
     //    golpear el núcleo con todas las peticiones a la vez, y UN reintento por
     //    página fallida: es la fase más cara y perder una página no debe tirar
     //    todo el sitio (causa raíz histórica del error no_files).
+    progress({ type: 'todo_update', id: 'pages', status: 'active' })
     const planJson = JSON.stringify(plan)
     const imageSlots = plan.images.map((i) => i.slot)
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -997,6 +1019,16 @@ export async function runWebFactory(input: {
           src = await buildPageOnce(page)
           if (src) console.error(`[web-factory] página ${page.path} recuperada en el reintento`)
         }
+        // Progreso en vivo: la página procesada (con imágenes inyectadas) se
+        // emite en cuanto está lista; la asignación final a `files` sigue abajo.
+        if (src) {
+          const processed = plan.framework === 'react'
+            ? injectImages(src, images)
+            : injectImages(stripExternalAssets(src), images)
+          emitFile(plan.framework === 'react' ? pageModule(page).file : page.path, processed)
+        } else {
+          progress({ type: 'stage_note', note: `La página ${page.title} no se pudo componer; seguimos con las demás.` })
+        }
         return { page, src }
       }),
     )
@@ -1028,6 +1060,11 @@ export async function runWebFactory(input: {
     }
   } else {
     // Modo edición: una llamada con el contexto completo.
+    progress({ type: 'todos', items: [
+      { id: 'analyze', label: 'Analizar el sitio actual', status: 'active' },
+      { id: 'edit', label: 'Aplicar los cambios pedidos', status: 'pending' },
+      { id: 'package', label: 'Empaquetar las descargas', status: 'pending' },
+    ] })
     const res = await buildChatJson<{ summary?: unknown; files?: unknown }>(
       updaterSystemPrompt(plan.framework),
       [
@@ -1052,6 +1089,9 @@ export async function runWebFactory(input: {
     if (changed.length === 0) throw new WebFactoryError('El editor no produjo cambios utilizables.', 'no_files')
     files = changed.map((f) => ({ path: f.path, content: plan.framework === 'react' ? injectImages(f.content, images) : injectImages(stripExternalAssets(f.content), images) }))
     plan.summary = s(res.data.summary, plan.summary, 400)
+    progress({ type: 'todo_update', id: 'analyze', status: 'done' })
+    progress({ type: 'todo_update', id: 'edit', status: 'done' })
+    for (const f of files) emitFile(f.path, f.content)
   }
 
   // Límite de archivos
@@ -1060,6 +1100,8 @@ export async function runWebFactory(input: {
   // 5) Validación honesta (puede autofijar metadatos/alt). En proyectos React:
   //    además, verificación REAL — se instalan las dependencias y se compila
   //    (bun install + tsc --noEmit + vite build) en un directorio temporal.
+  if (!existing) progress({ type: 'todo_update', id: 'pages', status: 'done' })
+  progress({ type: 'todo_update', id: 'validate', status: 'active' })
   let realBuild: Awaited<ReturnType<typeof verifyReactBuild>> | undefined
   if (plan.framework === 'react') {
     const filesToVerify = isUpdate
@@ -1082,10 +1124,15 @@ export async function runWebFactory(input: {
     console.error(`[web-factory] verificación real ${((Date.now() - vbStart) / 1000).toFixed(1)}s · install ${realBuild.install.status} · tsc ${realBuild.typecheck.status} · build ${realBuild.compile.status}`)
   }
   const { checks, warnings } = validateSite({ files, framework: plan.framework, realBuild })
+  progress({ type: 'todo_update', id: 'validate', status: 'done' })
 
   // 6) README determinista con procedencia y licencias
+  progress({ type: 'stage_note', note: 'Escribiendo el README y preparando las descargas…' })
   files = files.filter((f) => f.path !== 'README.md')
   files.push({ path: 'README.md', content: buildReadme(plan, files.map((f) => f.path), checks) })
+  emitFile('README.md', files.find((f) => f.path === 'README.md')?.content ?? '')
+  if (!existing) progress({ type: 'todo_update', id: 'readme', status: 'done' })
+  progress({ type: 'todo_update', id: 'package', status: 'done' })
 
   return {
     title: plan.title,

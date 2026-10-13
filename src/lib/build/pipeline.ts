@@ -15,6 +15,7 @@
  * Cada etapa registra su duración y núcleo en el log del servidor (sin contenido).
  */
 import { BuildLlmError, buildChatJson } from './llm'
+import { createProgressSink, type BuildProgressSink } from './progress'
 import {
   coderBackendSystemPrompt,
   coderBackendUserPrompt,
@@ -190,12 +191,29 @@ export async function runBuild(input: {
   brief: string
   mode: BuildMode
   signal?: AbortSignal
+  /** Sink opcional de progreso en vivo (SSE del constructor). */
+  onProgress?: BuildProgressSink
 }): Promise<BuildResult> {
+  const progress = createProgressSink(input.onProgress)
+
   // 1) Plan CONTRATO
   const planStart = Date.now()
+  progress({ type: 'stage_note', note: 'Diseñando la arquitectura de la app…' })
+  const todoItems = [
+    { id: 'plan', label: 'Planear la arquitectura', status: 'active' as const },
+    { id: 'frontend', label: 'Programar el frontend', status: 'pending' as const },
+    ...(input.mode === 'fullstack'
+      ? [{ id: 'backend', label: 'Programar la API y el servidor', status: 'pending' as const }]
+      : []),
+    { id: 'essentials', label: 'Completar archivos esenciales', status: 'pending' as const },
+    { id: 'package', label: 'Empaquetar las descargas', status: 'pending' as const },
+  ]
+  progress({ type: 'todos', items: todoItems })
   const planRes = await buildChatJson<RawPlan>(plannerSystemPrompt(), plannerUserPrompt(input.brief, input.mode), input.signal)
   const plan = parsePlan(planRes.data)
   console.error(`[build] plan ${((Date.now() - planStart) / 1000).toFixed(1)}s vía ${planRes.core} · ${plan.files.length} archivos · ${plan.endpoints.length} endpoints`)
+  progress({ type: 'title', title: plan.title, summary: plan.summary })
+  progress({ type: 'todo_update', id: 'plan', status: 'done' })
 
   // 2) Código en dos mitades paralelas que comparten el contrato
   const codeStart = Date.now()
@@ -203,25 +221,46 @@ export async function runBuild(input: {
   let files: BuildGeneratedFile[]
   let core = planRes.core
 
+  const emitFiles = (generated: BuildGeneratedFile[]) => {
+    for (const f of generated) {
+      progress({ type: 'file_done', path: f.path, language: languageFromPath(f.path), bytes: Buffer.byteLength(f.content, 'utf8'), content: f.content })
+    }
+  }
+
   if (input.mode === 'fullstack') {
+    progress({ type: 'todo_update', id: 'frontend', status: 'active' })
+    progress({ type: 'todo_update', id: 'backend', status: 'active' })
     const [front, back] = await Promise.allSettled([
       buildChatJson<{ files?: unknown }>(coderFrontendSystemPrompt(), coderFrontendUserPrompt(planJson), input.signal),
       buildChatJson<{ files?: unknown }>(coderBackendSystemPrompt(), coderBackendUserPrompt(planJson), input.signal),
     ])
     if (front.status === 'rejected' && back.status === 'rejected') {
       // Ambas mitades fallaron: propagar el primer error real.
+      progress({ type: 'todo_update', id: 'frontend', status: 'failed' })
+      progress({ type: 'todo_update', id: 'backend', status: 'failed' })
       throw front.reason instanceof Error ? front.reason : new BuildPipelineError('El generador falló.', 'provider_error')
     }
     files = []
     if (front.status === 'fulfilled') {
       core = front.value.core
-      files.push(...normalizeGeneratedFiles(front.value.data.files))
+      const frontFiles = normalizeGeneratedFiles(front.value.data.files)
+      files.push(...frontFiles)
+      emitFiles(frontFiles)
+      progress({ type: 'todo_update', id: 'frontend', status: 'done' })
+    } else {
+      progress({ type: 'todo_update', id: 'frontend', status: 'failed' })
     }
     if (back.status === 'fulfilled') {
-      files.push(...normalizeGeneratedFiles(back.value.data.files))
+      const backFiles = normalizeGeneratedFiles(back.value.data.files)
+      files.push(...backFiles)
+      emitFiles(backFiles)
+      progress({ type: 'todo_update', id: 'backend', status: 'done' })
+    } else {
+      progress({ type: 'todo_update', id: 'backend', status: 'failed' })
     }
     console.error(`[build] código paralelo ${((Date.now() - codeStart) / 1000).toFixed(1)}s · frontend:${front.status} backend:${back.status} · ${files.length} archivos`)
   } else {
+    progress({ type: 'todo_update', id: 'frontend', status: 'active' })
     const single = await buildChatJson<{ files?: unknown }>(
       coderFrontendOnlySystemPrompt(),
       `Implementa la app completa sin backend según el plan.\n\nPlan:\n${planJson.slice(0, 7000)}`,
@@ -229,6 +268,8 @@ export async function runBuild(input: {
     )
     core = single.core
     files = normalizeGeneratedFiles(single.data.files)
+    emitFiles(files)
+    progress({ type: 'todo_update', id: 'frontend', status: files.length > 0 ? 'done' : 'failed' })
     console.error(`[build] código ${((Date.now() - codeStart) / 1000).toFixed(1)}s vía ${core} · ${files.length} archivos`)
   }
 
@@ -238,15 +279,23 @@ export async function runBuild(input: {
     .filter((p) => !files.some((f) => f.path === p))
     .map((p) => ({ path: p, purpose: plan.files.find((f) => f.path === p)?.purpose ?? 'archivo esencial del plan' }))
   if (missing.length > 0 && missing.length < essentials.length) {
+    progress({ type: 'todo_update', id: 'essentials', status: 'active' })
     const filled = await fillMissing(missing, plan, input.mode, input.signal)
     for (const f of filled) {
       if (!files.some((x) => x.path === f.path)) files.push(f)
     }
+    emitFiles(filled)
+    progress({ type: 'todo_update', id: 'essentials', status: 'done' })
+  } else {
+    progress({ type: 'todo_update', id: 'essentials', status: 'done' })
   }
 
   if (files.length === 0) {
     throw new BuildPipelineError('El generador no produjo archivos utilizables.', 'no_files')
   }
+
+  progress({ type: 'stage_note', note: 'Archivos listos: descarga lo que quieras o el ZIP completo.' })
+  progress({ type: 'todo_update', id: 'package', status: 'done' })
 
   return {
     title: plan.title,
@@ -266,8 +315,16 @@ export async function runBuildUpdate(input: {
   changeRequest: string
   currentFiles: Array<{ path: string; content: string }>
   signal?: AbortSignal
+  /** Sink opcional de progreso en vivo (SSE del constructor). */
+  onProgress?: BuildProgressSink
 }): Promise<BuildResult> {
+  const progress = createProgressSink(input.onProgress)
   const start = Date.now()
+  progress({ type: 'todos', items: [
+    { id: 'analyze', label: 'Analizar la app actual', status: 'active' },
+    { id: 'edit', label: 'Aplicar los cambios pedidos', status: 'pending' },
+    { id: 'package', label: 'Empaquetar las descargas', status: 'pending' },
+  ] })
   const res = await buildChatJson<{ summary?: unknown; files?: unknown }>(
     updaterSystemPrompt(),
     updaterUserPrompt({
@@ -278,11 +335,19 @@ export async function runBuildUpdate(input: {
     input.signal,
   )
   console.error(`[build:update] ${((Date.now() - start) / 1000).toFixed(1)}s vía ${res.core}`)
+  progress({ type: 'todo_update', id: 'analyze', status: 'done' })
 
   const files = normalizeGeneratedFiles(res.data.files)
   if (files.length === 0) {
+    progress({ type: 'todo_update', id: 'edit', status: 'failed' })
     throw new BuildPipelineError('El generador no produjo cambios utilizables.', 'no_files')
   }
+  progress({ type: 'todo_update', id: 'edit', status: 'done' })
+  for (const f of files) {
+    progress({ type: 'file_done', path: f.path, language: languageFromPath(f.path), bytes: Buffer.byteLength(f.content, 'utf8'), content: f.content })
+  }
+  progress({ type: 'stage_note', note: 'Cambios listos: descarga lo que quieras o el ZIP completo.' })
+  progress({ type: 'todo_update', id: 'package', status: 'done' })
 
   return {
     title: '',

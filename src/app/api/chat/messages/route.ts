@@ -7,6 +7,9 @@ export const dynamic = 'force-dynamic'
 const PatchMessageSchema = z.object({
   id: z.string().regex(/^[a-z0-9_-]{6,45}$/i),
   content: z.string().min(1).max(60_000),
+  // Snapshot del constructor en vivo (BuildLivePanel) para reconstruir el panel
+  // al recargar el historial (mismo contrato que el hook envía al servidor).
+  buildJson: z.string().max(160_000).optional(),
 })
 
 /**
@@ -31,7 +34,13 @@ export async function PATCH(request: Request) {
         return Response.json({ error: 'Este chat es privado o no existe.' }, { status: 404 })
       }
     }
-    await db.chatMessage.update({ where: { id: body.id }, data: { content: body.content } })
+    await db.chatMessage.update({
+      where: { id: body.id },
+      data: {
+        content: body.content,
+        ...(body.buildJson !== undefined ? { buildJson: body.buildJson } : {}),
+      },
+    })
     return Response.json({ ok: true })
   } catch {
     return Response.json({ error: 'Payload inválido para actualizar el mensaje.' }, { status: 400 })

@@ -25,13 +25,14 @@ export interface MediaIntent {
   size: '1024x1024' | '768x1344' | '1344x768'
 }
 
-/** Verbos de creación (español + inglés), con y sin acentos. */
+/** Verbos de creación (español + inglés), con y sin acentos. Incluye débiles
+ * coloquiales ("quiero una imagen de…", "dame un logo de…", "hazme un dibujo…"). */
 const CREATE_VERB =
-  /\b(crea|crea[rme]|creáme|genera|genera[rme]|genérame|haz|hazme|hacer|dibuja|dibuja[rme]|dibújame|pinta|pinta[rme]|píntame|dise[ñn]a|dise[ñn]a[rme]|dise[ñn]ame|imagine|imagina|muestrame|muéstrame|ens[eé]ñame|make|create|generate|draw|design|paint|render)\b/i
+  /\b(crea|crea[rme]|creáme|creame|créame|genera|genera[rme]|genérame|generame|haz|hazme|hacer|dibuja|dibuja[rme]|dibújame|dibujame|pinta|pinta[rme]|píntame|pintame|ilustra|ilustrame|ilústrame|dise[ñn]a|dise[ñn]a[rme]|dise[ñn]ame|imagine|imagina|inventa|convierte|transforma|renderiza|renderízame|renderizame|quiero|quisiera|deseo|necesito|dame|make|create|generate|draw|design|paint|render|give me|i want)\b/i
 
 /** Objetos que disparan la generación (palabra clave + contexto). */
 const MEDIA_OBJECT =
-  /\b(un[ao]?\s+|el|la|los|las\s+)?(imagen|imágenes|imagenes|ilustraci[óo]n|ilustraciones|foto|fotos|picture|picsum|dibujo|dibujos|wallpaper|fondo de pantalla|fondos?|poster|p[óo]ster|banner|portada|logo|logotipo|icono|[íi]cono|icon|pictograma|avatar|emblema|escudo|insignia|svg|arte|artwork|gr[áa]fico|vector|sticker|pegatina|mascota|spinner|favicon)\b/i
+  /\b(un[ao]?\s+|el|la|los|las\s+)?(imagen|imágenes|imagenes|ilustraci[óo]n|ilustraciones|fotograf[íi]as?|foto|fotos|picture|picsum|dibujo|dibujos|wallpaper|fondo de pantalla|fondos?|poster|p[óo]ster|banner|portada|logo|logotipo|icono|[íi]cono|icon|pictograma|avatar|emblema|escudo|insignia|svg|arte|artwork|vector|sticker|pegatina|mascota|spinner|favicon|retrato|retratos|caricatura|caricaturas|mockup|maqueta|flyer|cartel|afiche|miniatura|thumbnail|tatuaje|tattoo|mural|pintura|monograma|pixel art|concept art|emote)\b/i
 
 /** Solo mensajes cortos e imperativos: evita secuestrar conversaciones largas
  * que mencionan imágenes de pasada (p. ej. "anoche vi una imagen de…"). */
@@ -74,7 +75,7 @@ export function detectMediaIntent(rawMessage: string): MediaIntent | null {
 
   // Formato: SVG solo explícito; icono/logo → PNG estilo icono; resto imagen.
   const explicitSvg = /\bsvg\b/i.test(message)
-  const isIconWord = /\b(icono|[íi]cono|icon|pictograma|logo|logotipo|emblema|insignia|favicon|mascota|sticker|spinner)\b/i.test(message)
+  const isIconWord = /\b(icono|[íi]cono|icon|pictograma|logo|logotipo|emblema|insignia|favicon|mascota|sticker|spinner|avatar|emote)\b/i.test(message)
   const format: MediaFormat = explicitSvg ? 'svg' : isIconWord ? 'icon' : 'image'
 
   // Sujeto: lo que sigue al objeto; si es vacío, lo que sigue al verbo.
@@ -105,6 +106,22 @@ export function detectMediaIntent(rawMessage: string): MediaIntent | null {
   return { format, subject, prompt, size }
 }
 
+/* ── Contexto y referencias web para el enriquecimiento del prompt ───────── */
+
+/** Sujeto vago que apunta a la conversación ("del tema", "eso que hablamos").
+ * Cuando dispara, el backend resuelve el tema real con el historial reciente. */
+export function isContextualSubject(subject: string): boolean {
+  return /\b(tema|esto|eso|aquello|lo anterior|lo de arriba|lo que (hablamos|comentamos|dijimos?|dije)|misma idea|conversaci[óo]n|contexto|ese tema|este tema|esa idea|esta idea|lo mismo)\b/i.test(
+    subject,
+  )
+}
+
+/** Petición que menciona marcas/lugares/realidad: activa la búsqueda de
+ * referencias reales en la web para inyectarlas en el prompt ("colocar marcas
+ * y más, todo lo que esté en la web"). */
+export const WEB_GROUND_RE =
+  /\b(marca|logotipo|logo|branding|brand|empresa|negocio|franquicia|producto|lugar|edificio|monumento|ciudad|pa[íi]s|bandera|uniforme|equipo|selecci[óo]n|celebridad|artista|banda|grupo musical|personaje real|de la web|de internet|en la web|fiel a la realidad|que sea real)\b/i
+
 /* ── Intención de GALERÍA: ver imágenes REALES de la web (no crear) ──────── */
 
 /** Verbos de búsqueda/visualización (ver lo que ya existe en la web). */
@@ -115,9 +132,12 @@ const SEARCH_VERB =
 const SEARCH_OBJECT =
   /\b(im[áa]genes?|imagenes?|fotos?|fotograf[íi]as?|pictures?|pics|photos?|fotograf[ií]as)\b/i
 
-/** Verbos de creación fuertes: si están, el usuario QUIERE generar (no buscar). */
+/** Verbos de creación FUERTES: si están, el usuario QUIERE generar (no buscar).
+ * Los débiles ("quiero/dame/deseo…") NO bloquean la galería: "quiero imágenes de
+ * París" sigue siendo búsqueda web; "quiero UNA imagen de París" (singular, sin
+ * verbo de búsqueda) cae en generación por el orden del router. */
 const STRONG_CREATE_VERB =
-  /\b(crea|crea[rme]|creáme|genera|genera[rme]|genérame|haz|hazme|hacer|dibuja|dibújame|pinta|p[íi]ntame|dise[ñn]a|dise[ñn]ame|make|create|generate|draw|design|paint|render)\b/i
+  /\b(crea|crea[rme]|creáme|creame|créame|genera|genera[rme]|genérame|generame|haz|hazme|hacer|dibuja|dibuja[rme]|dibújame|dibujame|pinta|pinta[rme]|p[íi]ntame|pintame|ilustra|ilustrame|ilústrame|dise[ñn]a|dise[ñn]a[rme]|dise[ñn]ame|convierte|transforma|renderiza|renderízame|renderizame|inventa|make|create|generate|draw|design|paint|render)\b/i
 
 export interface GalleryIntent {
   /** Tema del que buscar imágenes (para la directiva del system prompt). */
@@ -141,7 +161,15 @@ export function detectGalleryIntent(rawMessage: string): GalleryIntent | null {
 
   const searchVerb = SEARCH_VERB.test(message)
   const startsWithObject = objectMatch.index === 0
-  if (!searchVerb && !startsWithObject) return null
+  // Verbos débiles de deseo ("quiero/dame/necesito imágenes de…"): cuenta como
+  // búsqueda SI el objeto es plural y NO va precedido de artículo indefinido
+  // ("quiero UNA imagen de París" es generación de una imagen).
+  const beforeObject = message.slice(0, objectMatch.index)
+  const weakDesireSearch =
+    /\b(quiero|quisiera|deseo|necesito|dame|pasame|pásame)\b/i.test(beforeObject) &&
+    !/\b(un|una)\s+$/i.test(beforeObject) &&
+    /\b(im[áa]genes|imagenes|fotos|fotograf[íi]as|pictures|pics|photos)\b/i.test(message.slice(objectMatch.index))
+  if (!searchVerb && !startsWithObject && !weakDesireSearch) return null
 
   // Sujeto: lo que sigue al objeto ("imágenes DE arquitectura brutalista").
   let subject = message.slice(objectMatch.index + objectMatch[0].length)
