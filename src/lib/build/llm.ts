@@ -1,14 +1,14 @@
 /**
  * Cliente LLM del Constructor de Apps (servidor únicamente).
  *
- * Estrategia en cascada real según proveedores de código del propietario:
- *   1) GOOGLE GEMINI (GEMINI_API_KEY) — doble ruta automática:
- *      a) Vertex AI express (aiplatform.googleapis.com, sin bloqueo geo)
- *      b) AI Studio directo (generativelanguage.googleapis.com, requiere
- *         región soportada)
- *   2) GROQ (GROQ_API_KEY) — API compatible OpenAI (api.groq.com).
- *   3) Núcleo z-ai (reintentos ante 429).
- *   4) OpenRouter (modelo rápido verificado).
+ * Estrategia en DOS fases (carrera + respaldo) para máxima velocidad:
+ *   FASE 1 — CARRERA PARALELA (gana el primero en terminar, como la cascada
+ *   de imágenes): NVIDIA NIM (IAs de código abierto, nemotron-3-super 120B
+ *   con thinking OFF: ~25 s por archivo grande), OpenRouter (modelo free
+ *   verificado) y núcleo z-ai. Si un proveedor está sin cuota (429) simplemente
+ *   pierde la carrera; nadie bloquea a los demás.
+ *   FASE 2 — RESPALDOS SECUENCIALES (solo si TODA la carrera falló):
+ *   Google Gemini (doble ruta vertex/ai-studio) → Groq.
  * Cada proveedor falla RÁPIDO y sin reintentos inútiles si su región/clave no
  * está disponible, cediendo el turno al siguiente eslabón.
  * - Extracción robusta de JSON (los modelos suelen envolver la respuesta).
@@ -26,10 +26,19 @@ export class BuildLlmError extends Error {
   }
 }
 
-const RETRY_DELAYS_MS = [1500, 4000, 8000]
-/** Modelo rápido verificado en sondas reales (PONG 279-299 ms). */
-const OPENROUTER_BUILD_MODEL = 'openai/gpt-oss-20b'
-const OPENROUTER_TIMEOUT_MS = 180_000
+/** Modelo FREE verificado con prueba real (JSON limpio, sin reasoning). */
+const OPENROUTER_BUILD_MODEL =
+  process.env.OPENROUTER_BUILD_MODEL || 'nvidia/nemotron-3-super-120b-a12b:free'
+const OPENROUTER_TIMEOUT_MS = 150_000
+
+/**
+ * NVIDIA NIM (integrate.api.nvidia.com) — IAs de código abierto gratis.
+ * nemotron-3-super-120b-a12b con thinking OFF generó 7.5 KB de JSON de código
+ * real en ~25 s (prueba E2E); los 16k tokens sin thinking:false se quemaban
+ * en razonamiento interno (content vacío).
+ */
+const NVIDIA_MODEL = process.env.NVIDIA_BUILD_MODEL || 'nvidia/nemotron-3-super-120b-a12b'
+const NVIDIA_TIMEOUT_MS = 150_000
 
 /** Proveedor de código Google Gemini (configurable por .env). */
 const GEMINI_MODEL = process.env.GEMINI_BUILD_MODEL || 'gemini-3.1-pro-preview'
@@ -39,13 +48,61 @@ const GEMINI_TIMEOUT_MS = 180_000
 const GROQ_MODEL = process.env.GROQ_BUILD_MODEL || 'openai/gpt-oss-120b'
 const GROQ_TIMEOUT_MS = 180_000
 
-export type BuildCore = `gemini/${string}` | `groq/${string}` | 'openrouter/gpt-oss-20b' | 'zai-org:default'
+export type BuildCore =
+  | `gemini/${string}`
+  | `groq/${string}`
+  | `nvidia/${string}`
+  | `openrouter/${string}`
+  | 'zai-org:default'
 
 export type CorePreference = 'zai' | 'openrouter'
 
 interface CoreCallResult {
   content: string
   core: BuildCore
+}
+
+/** Miembro de la carrera: un proveedor con un solo intento (falla rápido). */
+interface Racer {
+  id: string
+  core: BuildCore
+  run: () => Promise<string>
+}
+
+/**
+ * Carrera paralela de generadores: resuelve con el PRIMER resultado exitoso y
+ * rechaza solo si TODOS fallan (AggregateError con los errores individuales).
+ * Mismo patrón probado de image-cascade.ts (fase 1).
+ */
+function raceRacers(racers: Racer[]): Promise<CoreCallResult> {
+  return new Promise((resolve, reject) => {
+    let pending = racers.length
+    let settled = false
+    if (pending === 0) {
+      reject(new Error('Sin proveedores en la carrera de código.'))
+      return
+    }
+    const errors: Array<{ id: string; message: string }> = []
+    for (const racer of racers) {
+      racer
+        .run()
+        .then((content) => {
+          if (!settled) {
+            settled = true
+            console.warn(`[build:llm] carrera: ganó ${racer.id}`)
+            resolve({ content, core: racer.core })
+          }
+        })
+        .catch((err) => {
+          errors.push({ id: racer.id, message: err instanceof Error ? err.message.slice(0, 120) : String(err) })
+          pending -= 1
+          if (pending === 0 && !settled) {
+            settled = true
+            reject(new AggregateError(errors.map((e) => new Error(`${e.id}: ${e.message}`)), 'Toda la carrera de código falló.'))
+          }
+        })
+    }
+  })
 }
 
 interface GeminiCandidate {
@@ -156,6 +213,41 @@ async function geminiChat(messages: ChatRequestMessage[], signal?: AbortSignal):
 }
 
 /**
+ * Llamada a NVIDIA NIM (endpoint compatible OpenAI) con thinking DESACTIVADO.
+ * Modelo de código abierto 120B-A12B (MoE): rápido y con JSON limpio.
+ */
+async function nvidiaChat(messages: ChatRequestMessage[], signal?: AbortSignal): Promise<string> {
+  const key = process.env.NVIDIA_API_KEY
+  if (!key) throw new BuildLlmError('NVIDIA_API_KEY no configurada.', 'provider_error')
+  const res = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: NVIDIA_MODEL,
+      messages,
+      // CRÍTICO: sin esto el modelo quema TODOS los tokens en razonamiento
+      // interno y devuelve content vacío con finish_reason=length.
+      chat_template_kwargs: { thinking: false },
+      max_tokens: 16_384,
+      temperature: 0.6,
+    }),
+    signal: signal ?? AbortSignal.timeout(NVIDIA_TIMEOUT_MS),
+  })
+  if (res.status === 429) throw new BuildLlmError('429', 'rate_limited')
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '')
+    throw new BuildLlmError(`NVIDIA HTTP ${res.status}: ${detail.slice(0, 160)}`, 'provider_error')
+  }
+  const data = (await res.json()) as { choices?: Array<{ message?: { content?: string | null } }> }
+  const content = data.choices?.[0]?.message?.content ?? ''
+  if (!content.trim()) throw new BuildLlmError('Respuesta vacía de NVIDIA.', 'empty_response')
+  return content
+}
+
+/**
  * Llamada a Groq (API compatible OpenAI, api.groq.com) con la clave del
  * propietario. Si Groq bloquea la región del servidor responde 403 Forbidden
  * (incluso sin clave): se detecta y cede el turno al siguiente núcleo sin
@@ -242,80 +334,76 @@ async function zaiCoreChat(messages: ChatRequestMessage[], signal?: AbortSignal)
 }
 
 /**
- * Llamada de texto con estrategia en cascada real según preferencia:
- * - Gemini y Groq (si sus claves existen) SIEMPRE primero: proveedores de
- *   código del propietario; si no están disponibles (región, cuota o API
- *   deshabilitada) fallan rápido y la cascada continúa sin interrumpir.
- * - 'zai' (defecto tras los proveedores del propietario): 1) Núcleo z-ai con
- *   reintentos 429 → 2) OpenRouter como respaldo.
- * - 'openrouter': 1) OpenRouter → 2) Núcleo z-ai.
+ * Llamada de texto con estrategia en DOS fases:
+ * - FASE 1 (carrera): NVIDIA NIM ↔ OpenRouter ↔ núcleo z-ai EN PARALELO;
+ *   gana el primero en devolver contenido completo. Los tres son IAs de
+ *   código abierto / núcleo propio, así que la carrera no cuesta latencia:
+ *   el tiempo total es el del más rápido.
+ * - FASE 2 (respaldos secuenciales, solo si toda la carrera falló):
+ *   Gemini → Groq con un intento cada uno (429 de cuota no se reintenta).
+ * 'prefer' se mantiene por compatibilidad de firma; la carrera ya cubre los
+ * dos órdenes posibles.
  */
 export async function buildChatWithCore(
   messages: ChatRequestMessage[],
   signal?: AbortSignal,
   prefer: CorePreference = 'zai',
 ): Promise<CoreCallResult> {
-  const rest: Array<'zai' | 'openrouter'> =
-    prefer === 'openrouter' ? ['openrouter', 'zai'] : ['zai', 'openrouter']
-  const owner: Array<'gemini' | 'groq'> = [
-    ...(process.env.GEMINI_API_KEY ? (['gemini'] as const) : []),
-    ...(process.env.GROQ_API_KEY ? (['groq'] as const) : []),
-  ]
-  const order: Array<'gemini' | 'groq' | 'zai' | 'openrouter'> = [...owner, ...rest]
-  let lastError: unknown = null
+  if (signal?.aborted) throw new BuildLlmError('Ejecución cancelada.', 'aborted')
 
-  for (const target of order) {
-    if (target === 'openrouter' && !process.env.OPENROUTER_API_KEY) continue
-    if (target === 'gemini' && !process.env.GEMINI_API_KEY) continue
-    if (target === 'groq' && !process.env.GROQ_API_KEY) continue
-    for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
-      if (signal?.aborted) throw new BuildLlmError('Ejecución cancelada.', 'aborted')
+  // FASE 1: carrera paralela de los proveedores rápidos de código abierto.
+  const racers: Racer[] = []
+  if (process.env.NVIDIA_API_KEY?.trim()) {
+    racers.push({ id: 'nvidia', core: `nvidia/${NVIDIA_MODEL}` as BuildCore, run: () => nvidiaChat(messages, signal) })
+  }
+  if (process.env.OPENROUTER_API_KEY?.trim()) {
+    racers.push({
+      id: 'openrouter',
+      core: `openrouter/${OPENROUTER_BUILD_MODEL}` as BuildCore,
+      run: () => openRouterChat(messages, signal),
+    })
+  }
+  racers.push({ id: 'zai', core: 'zai-org:default', run: () => zaiCoreChat(messages, signal) })
+
+  try {
+    return await raceRacers(racers)
+  } catch (raceErr) {
+    if (signal?.aborted) throw new BuildLlmError('Ejecución cancelada.', 'aborted')
+    console.warn('[build:llm] la carrera de código falló; probando respaldos secuenciales…')
+
+    // FASE 2: respaldos lentos/secundarios, un intento cada uno.
+    const fallbacks: Racer[] = []
+    if (process.env.GEMINI_API_KEY?.trim()) {
+      fallbacks.push({ id: 'gemini', core: `gemini/${GEMINI_MODEL}` as BuildCore, run: () => geminiChat(messages, signal) })
+    }
+    if (process.env.GROQ_API_KEY?.trim()) {
+      fallbacks.push({ id: 'groq', core: `groq/${GROQ_MODEL}` as BuildCore, run: () => groqChat(messages, signal) })
+    }
+    let lastError: unknown = raceErr
+    for (const fb of fallbacks) {
       try {
-        const content =
-          target === 'openrouter'
-            ? await openRouterChat(messages, signal)
-            : target === 'gemini'
-              ? await geminiChat(messages, signal)
-              : target === 'groq'
-                ? await groqChat(messages, signal)
-                : await zaiCoreChat(messages, signal)
-        return {
-          content,
-          core:
-            target === 'openrouter'
-              ? 'openrouter/gpt-oss-20b'
-              : target === 'gemini'
-                ? (`gemini/${GEMINI_MODEL}` as BuildCore)
-                : target === 'groq'
-                  ? (`groq/${GROQ_MODEL}` as BuildCore)
-                  : 'zai-org:default',
-        }
+        const content = await fb.run()
+        console.warn(`[build:llm] respaldo secuencial exitoso: ${fb.id}`)
+        return { content, core: fb.core }
       } catch (err) {
         if (signal?.aborted) throw new BuildLlmError('Ejecución cancelada.', 'aborted')
         if (err instanceof BuildLlmError && err.errorType === 'aborted') throw err
         lastError = err
-        const isRate = err instanceof Error && err.message.includes('429')
-        const isLast = attempt === RETRY_DELAYS_MS.length
-        if (isRate && !isLast) {
-          await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]))
-          continue
-        }
-        break
       }
     }
-  }
 
-  const message = lastError instanceof Error ? lastError.message : 'Error desconocido del núcleo'
-  if (message.includes('429')) {
+    const message = lastError instanceof Error ? lastError.message : 'Error desconocido del núcleo'
+    if (message.includes('429')) {
+      throw new BuildLlmError(
+        'Los núcleos alcanzaron su límite de peticiones (429). Espera unos segundos e inténtalo de nuevo.',
+        'rate_limited',
+      )
+    }
     throw new BuildLlmError(
-      'Los núcleos alcanzaron su límite de peticiones (429). Espera unos segundos e inténtalo de nuevo.',
-      'rate_limited',
+      'El constructor no pudo completar el paso con ningún núcleo configurado. No se generó nada simulado.',
+      'provider_error',
     )
   }
-  throw new BuildLlmError(
-    'El constructor no pudo completar el paso con ningún núcleo configurado. No se generó nada simulado.',
-    'provider_error',
-  )
 }
 
 /** Extrae el primer objeto JSON balanceado de una respuesta de modelo. */

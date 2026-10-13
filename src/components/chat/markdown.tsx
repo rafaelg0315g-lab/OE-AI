@@ -160,6 +160,7 @@ type RichSegment =
   | { type: 'plan'; text: string; closed: boolean }
   | { type: 'gallery'; text: string; closed: boolean }
   | { type: 'svg'; text: string; closed: boolean }
+  | { type: 'oe-directive'; text: string; closed: boolean }
 
 /**
  * Divide el contenido en segmentos markdown y bloques ricos. Las vallas de
@@ -177,15 +178,28 @@ function splitRichSegments(src: string): RichSegment[] {
       return
     }
     // Segmento de texto: localizar bloques :::cards / :::plan / :::gallery / :::svg
+    // y también :::oe-build / :::oe-web (variante errónea de la directiva de
+    // construcción: se muestra como estado "construyendo", nunca JSON crudo).
     let rest = chunk
     while (true) {
-      const open = /[ \t]*:::(cards|svg|plan|gallery)[ \t]*(?:-[^\n]*)?\n?/.exec(rest)
+      const open = /[ \t]*:::(cards|svg|plan|gallery|oe-build|oe-web)\b[^\n]*\n?/.exec(rest)
       if (!open) {
         if (rest) segments.push({ type: 'md', text: rest })
         break
       }
       if (open.index > 0) segments.push({ type: 'md', text: rest.slice(0, open.index) })
-      const kind = (open[1] === 'svg' ? 'svg' : open[1]) as Exclude<RichSegment, { type: 'md' }>['type']
+      const label = open[1]
+      if (label === 'oe-build' || label === 'oe-web') {
+        // Directiva con ::: (variante de modelo): el contenido real (JSON) lo
+        // procesa extractBuildDirective sobre el texto completo; aquí solo se
+        // oculta el bloque y se muestra el estado de construcción.
+        const after = rest.slice(open.index + open[0].length)
+        const closeIdx = after.search(/^[ \t]*:::[ \t]*$/m)
+        segments.push({ type: 'oe-directive', text: closeIdx === -1 ? after : after.slice(0, closeIdx), closed: closeIdx !== -1 })
+        rest = closeIdx === -1 ? '' : after.slice(closeIdx).replace(/^[ \t]*:::[ \t]*\n?/, '')
+        continue
+      }
+      const kind = (label === 'svg' ? 'svg' : label) as Exclude<RichSegment, { type: 'md' } | { type: 'oe-directive' }>['type']
       const after = rest.slice(open.index + open[0].length)
       const closeIdx = after.search(/^[ \t]*:::[ \t]*$/m)
       if (closeIdx === -1) {
@@ -651,6 +665,11 @@ export const Markdown = memo(function Markdown({
           // y, al completarse el bloque, salta a la tarjeta con vista previa.
           if (!seg.closed) return <CodeBlock key={i} code={trimmed} lang="svg" />
           return <SvgCard key={i} code={trimmed} />
+        }
+        if (seg.type === 'oe-directive') {
+          // Directiva :::oe-build/:::oe-web: el flujo real de construcción lo
+          // dispara el hook sobre el texto completo; aquí solo se ve el estado.
+          return <BuildDirectivePending key={i} />
         }
         return <MarkdownSegment key={i} text={seg.text} onOpenCanvas={onOpenCanvas} serif={serif} />
       })}

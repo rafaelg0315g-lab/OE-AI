@@ -240,6 +240,13 @@ export async function runBuild(input: {
       progress({ type: 'todo_update', id: 'backend', status: 'failed' })
       throw front.reason instanceof Error ? front.reason : new BuildPipelineError('El generador falló.', 'provider_error')
     }
+    // Diagnóstico: registrar POR QUÉ falló una mitad (la otra mitad sigue).
+    if (front.status === 'rejected') {
+      console.error(`[build] mitad frontend rechazada: ${front.reason instanceof Error ? front.reason.message.slice(0, 160) : front.reason}`)
+    }
+    if (back.status === 'rejected') {
+      console.error(`[build] mitad backend rechazada: ${back.reason instanceof Error ? back.reason.message.slice(0, 160) : back.reason}`)
+    }
     files = []
     if (front.status === 'fulfilled') {
       core = front.value.core

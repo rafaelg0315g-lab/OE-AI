@@ -581,14 +581,12 @@ export async function POST(request: Request) {
 
   // Respaldo EN EJECUCIÓN (política del producto): si el núcleo OE AI LLM (z-ai)
   // falla —incluido el caso de despliegues sin credenciales del SDK, p. ej. Vercel—
-  // la cadena continúa: 1) Gemini directo (AI Studio; texto Y visión),
-  // 2) OpenRouter (solo texto). Cada respaldo se informa con honestidad vía SSE.
+  // la cadena continúa: 1) OpenRouter (rutas free del propietario),
+  // 2) NVIDIA NIM (IAs de código abierto, verificado), 3) Gemini directo al
+  // final (texto Y visión; suele estar sin cuota, por eso ya no va primero).
+  // Cada respaldo se informa con honestidad vía SSE.
   type RuntimeFallback = { id: string; label: string; adapter: NonNullable<ReturnType<typeof providerRegistry.get>>; route: RoutableRoute }
   const runtimeFallbacks: RuntimeFallback[] = []
-  if (decision.route.providerId !== 'gemini-direct' && process.env.GEMINI_API_KEY?.trim()) {
-    const geminiAdapter = createGeminiDirectMiniAdapter() as unknown as RuntimeFallback['adapter']
-    runtimeFallbacks.push({ id: 'gemini-direct', label: 'Gemini (respaldo directo)', adapter: geminiAdapter, route: GEMINI_DIRECT_ROUTE })
-  }
   if (!attachment && decision.route.providerId !== 'openrouter' && process.env.OPENROUTER_API_KEY) {
     const orRoutes = providerRegistry.availableRoutes().filter((r) => r.providerId === 'openrouter')
     if (orRoutes.length > 0) {
@@ -608,6 +606,20 @@ export async function POST(request: Request) {
         }
       }
     }
+  }
+  if (!attachment && decision.route.providerId !== 'nvidia' && process.env.NVIDIA_API_KEY?.trim()) {
+    const nvRoutes = providerRegistry.availableRoutes().filter((r) => r.providerId === 'nvidia')
+    const nvRoute = nvRoutes[0] ?? null
+    if (nvRoute) {
+      const nvAdapter = providerRegistry.get('nvidia')
+      if (nvAdapter) {
+        runtimeFallbacks.push({ id: 'nvidia', label: 'NVIDIA NIM (código abierto)', adapter: nvAdapter, route: nvRoute })
+      }
+    }
+  }
+  if (decision.route.providerId !== 'gemini-direct' && process.env.GEMINI_API_KEY?.trim()) {
+    const geminiAdapter = createGeminiDirectMiniAdapter() as unknown as RuntimeFallback['adapter']
+    runtimeFallbacks.push({ id: 'gemini-direct', label: 'Gemini (respaldo directo)', adapter: geminiAdapter, route: GEMINI_DIRECT_ROUTE })
   }
 
   // 5) Sesión + historial. Los chats de usuarios verificados son PRIVADOS:

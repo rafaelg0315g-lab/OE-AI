@@ -169,12 +169,17 @@ export async function POST(request: Request) {
         coreLabel: isWeb ? 'OE Web Factory' : 'OE Builder',
       })
 
+      // Latido SSE: nota de progreso con segundos transcurridos cada 7 s para
+      // que la conexión nunca quede en silencio durante las fases largas de
+      // código (buffers intermedios) y el panel muestre tiempo real.
+      // Declarado FUERA del try: si el cuerpo falla antes de crearse, el
+      // finally no debe romperse con ReferenceError (ocurrió con un chunk
+      // stale de Turbopack y convertía el fallo en un 500 sin eventos).
+      let heartbeat: ReturnType<typeof setInterval> | undefined
+      const buildStartedAt = Date.now()
+
       try {
-        // Latido SSE: nota de progreso con segundos transcurridos cada 7 s para
-        // que la conexión nunca quede en silencio durante las fases largas de
-        // código (buffers intermedios) y el panel muestre tiempo real.
-        const buildStartedAt = Date.now()
-        const heartbeat = setInterval(() => {
+        heartbeat = setInterval(() => {
           const elapsed = Math.round((Date.now() - buildStartedAt) / 1000)
           send('note', { note: `Trabajando en tu ${body.kind === 'web' ? 'sitio' : 'app'}… (${elapsed} s)` })
         }, 7_000)
@@ -329,7 +334,7 @@ export async function POST(request: Request) {
         })
         send('error', { message, errorType, projectId: project.id, requestId })
       } finally {
-        clearInterval(heartbeat)
+        if (heartbeat) clearInterval(heartbeat)
         try {
           controller.close()
         } catch {

@@ -110,8 +110,12 @@ export function createOpenAICompatibleAdapter(
             stream: false,
             // OpenRouter: excluye el razonamiento de los modelos reasoning
             // (nemotron…): evita que el 'thinking' se cuele en el contenido.
-            // Los demás proveedores no reciben este campo (podrían rechazarlo).
+            // NVIDIA NIM: apaga el thinking de nemotron vía plantilla de chat;
+            // sin esto el modelo devuelve content vacío (tokens quemados en
+            // razonamiento interno). Los demás proveedores no reciben campos
+            // extra (podrían rechazarlos).
             ...(def.id === 'openrouter' ? { reasoning: { exclude: true } } : {}),
+            ...(def.id === 'nvidia' ? { chat_template_kwargs: { thinking: false } } : {}),
           }),
           signal: options.signal,
           cache: 'no-store',
@@ -174,8 +178,9 @@ export function createOpenAICompatibleAdapter(
                   model: options.providerModelId,
                   messages: options.messages,
                   stream: true,
-                  // Mismo motivo que en chat() (solo OpenRouter).
+                  // Mismo motivo que en chat() (solo OpenRouter y NVIDIA).
                   ...(def.id === 'openrouter' ? { reasoning: { exclude: true } } : {}),
+                  ...(def.id === 'nvidia' ? { chat_template_kwargs: { thinking: false } } : {}),
                 }),
                 signal: options.signal,
                 cache: 'no-store',

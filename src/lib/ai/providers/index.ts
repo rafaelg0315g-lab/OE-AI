@@ -13,6 +13,15 @@ import { createOpenAICompatibleAdapter, type OpenAICompatibleProviderDef } from 
 
 const OPENAI_COMPATIBLE_DEFS: OpenAICompatibleProviderDef[] = [
   {
+    id: 'nvidia',
+    label: 'NVIDIA NIM',
+    baseUrl: 'https://integrate.api.nvidia.com/v1',
+    envVarNames: ['NVIDIA_API_KEY'],
+    endpointStatus: 'verified',
+    streaming: true, // SSE verificado con prueba real (deltas tipo OpenAI)
+    note: 'Endpoint verificado con prueba real: chat/completions y streaming SSE sobre IAs de código abierto (nemotron-3-super-120b, deepseek, glm…). El adaptador envía chat_template_kwargs {thinking:false} para que el contenido no se queme en razonamiento interno.',
+  },
+  {
     id: 'openrouter',
     label: 'OpenRouter',
     baseUrl: 'https://openrouter.ai/api/v1',

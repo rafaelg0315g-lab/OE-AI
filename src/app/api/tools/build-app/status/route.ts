@@ -19,6 +19,26 @@ function safeParse<T>(raw: string | null | undefined, fallback: T): T {
   }
 }
 
+/** Un build legítimo nunca supera ~5 min (el peor caso Web Factory midió 4.3).
+ * Si un proyecto sigue 'building' pasado ese margen es un HUÉRFANO: el proceso
+ * que lo construía murió (reinicio del servidor, crash, deploy). Se reporta y
+ * persiste como error para que el cliente deje de sondear y muestre un mensaje
+ * honesto en vez de quedarse cargando para siempre. (6 min < deadline de 8 min
+ * del sondeo del cliente: el cliente ve el error, no su propio timeout.) */
+const ORPHAN_BUILD_MS = 6 * 60_000
+
+async function resolveOrphanBuild<
+  P extends { id: string; status: string; updatedAt: Date; errorType: string | null },
+>(p: P): Promise<P> {
+  if (p.status !== 'building') return p
+  if (Date.now() - p.updatedAt.getTime() < ORPHAN_BUILD_MS) return p
+  const errorType = 'build_interrupted'
+  await db.buildProject
+    .update({ where: { id: p.id }, data: { status: 'error', errorType } })
+    .catch(() => null)
+  return { ...p, status: 'error', errorType }
+}
+
 /**
  * GET /api/tools/build-app/status?sessionId=<uuid>[&projectId=<id>]
  * Estado REAL de la construcción (apps del Constructor y sitios Web Factory).
@@ -106,18 +126,20 @@ export async function GET(request: Request) {
       include: { files: { select: { path: true, language: true, bytes: true }, orderBy: { path: 'asc' } } },
     })
     if (!project) return Response.json({ project: null }, { headers: { 'Cache-Control': 'no-store' } })
+    const resolved = await resolveOrphanBuild(project)
     return Response.json(
-      { project: toDetail(project) },
+      { project: toDetail(resolved) },
       { headers: { 'Cache-Control': 'no-store' } },
     )
   }
 
-  const recent = await db.buildProject.findMany({
+  const recentRows = await db.buildProject.findMany({
     where: { sessionId },
     orderBy: { createdAt: 'desc' },
     take: 10,
     select: { id: true, title: true, status: true, mode: true, errorType: true, createdAt: true, updatedAt: true },
   })
+  const recent = await Promise.all(recentRows.map((p) => resolveOrphanBuild(p)))
 
   const latest =
     recent.length > 0
@@ -129,7 +151,7 @@ export async function GET(request: Request) {
 
   return Response.json(
     {
-      project: latest ? toDetail(latest) : null,
+      project: latest ? toDetail(await resolveOrphanBuild(latest)) : null,
       projects: recent.map((p) => ({
         id: p.id,
         title: p.title,

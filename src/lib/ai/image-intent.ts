@@ -38,6 +38,20 @@ const MEDIA_OBJECT =
  * que mencionan imágenes de pasada (p. ej. "anoche vi una imagen de…"). */
 const MAX_INTENT_CHARS = 240
 
+/**
+ * Peticiones de CÓDIGO (HTML/CSS/JS/JSON/páginas web…): NUNCA son un turno de
+ * imagen. Sin este guardia, "genera un HTML de una tarjeta con avatar circular"
+ * secuestraba el turno como imagen (por la palabra "avatar") y el usuario
+ * terminaba viendo errores de cuota de los generadores visuales en vez de código.
+ */
+const CODE_REQUEST_RE =
+  /\b(html|css|scss|javascript|typescript|jsx|tsx|json|xml|c[óo]digo(?:\s+fuente)?|script|snippet|p[áa]ginas? web|sitio web|web est[áa]tica|landing(?: page)?|componente|api rest|función javascript)\b/i
+
+/** Objetos VISUALES nucleares: si uno de estos está presente junto a palabras de
+ * código, gana la generación visual ("genera UNA IMAGEN de una página web"). */
+const CORE_VISUAL_RE =
+  /\b(imagen|imágenes|imagenes|foto|fotos|fotograf[íi]a|ilustraci[óo]n|dibujos?|icono|[íi]cono|icon|logo|logotipo|svg|banner|poster|p[óo]ster|caricatura|pintura|mural|tatuaje|miniatura|thumbnail|wallpaper|favicon|sticker|pixel art|flyer|cartel|afiche|mockup|maqueta)\b/i
+
 /** Conectores que quedan entre "imagen" y el sujeto ("una imagen DE un gato"). */
 const LEADING_CONNECTOR = /^[\s:,;—–-]*(de|del|sobre|acerca de|para|que muestre|que represente|con tema|of|about|showing|with|for)\s+/i
 
@@ -61,6 +75,11 @@ function detectSize(message: string, format: MediaFormat): MediaIntent['size'] {
 export function detectMediaIntent(rawMessage: string): MediaIntent | null {
   const message = rawMessage.trim()
   if (!message || message.length > MAX_INTENT_CHARS) return null
+
+  // Guardia de código: pedir HTML/CSS/JS/código es un turno de TEXTO (o una
+  // directiva de construcción), no una imagen — salvo que se mencione también
+  // un objeto visual nuclear ("genera UNA IMAGEN de una web").
+  if (CODE_REQUEST_RE.test(message) && !CORE_VISUAL_RE.test(message)) return null
 
   const objectMatch = MEDIA_OBJECT.exec(message)
   if (!objectMatch) return null

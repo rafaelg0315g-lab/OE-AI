@@ -181,6 +181,8 @@ function describeBuildError(errorType?: string | null): string {
   switch (errorType) {
     case 'no_files':
       return 'el núcleo no devolvió archivos utilizables (inténtalo de nuevo).'
+    case 'build_interrupted':
+      return 'la construcción se interrumpió (el servidor se reinició a mitad del proceso); pídela de nuevo y terminará en menos de 2 minutos.'
     case 'rate_limited':
       return 'el núcleo alcanzó su límite de peticiones; espera un momento e inténtalo de nuevo.'
     case 'empty_response':
@@ -243,10 +245,6 @@ function oeProjectContent(
 /** Nota de error persistida por el constructor (se usa en el healing). */
 const BUILD_ERROR_NOTE_RE = /⚠️ No se pudo (?:construir|completar|iniciar) la (?:app|web|construcción)/
 
-/**
- * Extrae la directiva ```oe-build del texto del asistente (constructor de apps).
- * Devuelve el brief refinado y el texto de anuncio previo a la valla.
- */
 interface BuildDirectivePayload {
   name?: string
   brief: string
@@ -256,25 +254,29 @@ interface BuildDirectivePayload {
   prefix: string
 }
 
+/**
+ * Extrae la directiva del constructor de apps del texto del asistente.
+ * Acepta TODAS las variantes que los núcleos emiten en la práctica:
+ *  - ```oe-build\n{...}\n``` / ```oe-web\n{...}\n```  (canónica)
+ *  - :::oe-build {...} ::: / :::oe-web\n{...}\n:::   (los modelos confunden la
+ *    directiva con los bloques ricos :::cards/:::plan y la emiten con :::;
+ *    sin este soporte el JSON crudo quedaba pegado en el chat y NUNCA
+ *    arrancaba la construcción).
+ * Localiza el marcador, extrae el primer objeto JSON balanceado que le sigue y
+ * devuelve el brief + el anuncio previo (prefix).
+ */
 function extractBuildDirective(text: string): BuildDirectivePayload | null {
-  const webIdx = text.indexOf('```oe-web')
-  const appIdx = text.indexOf('```oe-build')
-  const kind: 'app' | 'web' = webIdx !== -1 && (appIdx === -1 || webIdx < appIdx) ? 'web' : 'app'
-  const fenceStart = kind === 'web' ? webIdx : appIdx
-  if (fenceStart === -1) return null
-  const bodyStart = text.indexOf('\n', fenceStart)
-  if (bodyStart === -1) return null
-  const fenceEnd = text.indexOf('```', bodyStart)
-  if (fenceEnd === -1) return null
-  const raw = text.slice(bodyStart, fenceEnd).trim()
-  const start = raw.indexOf('{')
-  if (start === -1) return null
+  const marker = /(?:```|:::)oe-(web|build)\b/.exec(text)
+  if (!marker) return null
+  const kind: 'app' | 'web' = marker[1] === 'web' ? 'web' : 'app'
+  const jsonStart = text.indexOf('{', marker.index + marker[0].length)
+  if (jsonStart === -1) return null
   let depth = 0
   let inString = false
   let escaped = false
   let end = -1
-  for (let i = start; i < raw.length; i++) {
-    const ch = raw[i]
+  for (let i = jsonStart; i < text.length; i++) {
+    const ch = text[i]
     if (inString) {
       if (escaped) escaped = false
       else if (ch === '\\') escaped = true
@@ -293,7 +295,7 @@ function extractBuildDirective(text: string): BuildDirectivePayload | null {
   }
   if (end === -1) return null
   try {
-    const parsed = JSON.parse(raw.slice(start, end + 1)) as {
+    const parsed = JSON.parse(text.slice(jsonStart, end + 1)) as {
       name?: unknown
       brief?: unknown
       mode?: unknown
@@ -302,8 +304,9 @@ function extractBuildDirective(text: string): BuildDirectivePayload | null {
     const brief = typeof parsed.brief === 'string' ? parsed.brief.trim() : ''
     if (!brief) return null
     const prefix = text
-      .slice(0, fenceStart)
+      .slice(0, marker.index)
       .replace(/```[a-z]*\s*$/, '')
+      .replace(/::{1,3}\s*$/, '')
       .trim()
     return {
       brief: brief.slice(0, 6000),
@@ -904,10 +907,31 @@ export function useOeChat(options?: { initialChatId?: string }) {
       const startedAt = Date.now()
 
       // Snapshot local del build en vivo (fuente única para el estado Y la persistencia).
+      // Las tareas se pre-cargan con la lista estándar del pipeline (el evento
+      // SSE 'todos' las reemplazará por la real): así el panel NUNCA arranca en
+      // 0/1 congelado mientras llegan los primeros eventos.
+      const initialTodos: BuildLiveTodo[] = isWeb
+        ? [
+            { id: 'plan', label: 'Planear el sitio', status: 'active' },
+            { id: 'shell', label: 'Levantar el diseño base', status: 'pending' },
+            { id: 'pages', label: 'Programar las páginas', status: 'pending' },
+            { id: 'validate', label: 'Validar el resultado', status: 'pending' },
+            { id: 'readme', label: 'Documentar el proyecto', status: 'pending' },
+            { id: 'package', label: 'Empaquetar las descargas', status: 'pending' },
+          ]
+        : [
+            { id: 'plan', label: 'Planear la arquitectura', status: 'active' },
+            { id: 'frontend', label: 'Programar el frontend', status: 'pending' },
+            ...(directive.mode !== 'frontend'
+              ? [{ id: 'backend', label: 'Programar la API y el servidor', status: 'pending' as const }]
+              : []),
+            { id: 'essentials', label: 'Completar archivos esenciales', status: 'pending' },
+            { id: 'package', label: 'Empaquetar las descargas', status: 'pending' },
+          ]
       let snapshot: BuildLiveSnapshot = {
         kind: directive.kind,
         status: 'building',
-        todos: [{ id: 'plan', label: isWeb ? 'Planear el sitio' : 'Planear la arquitectura', status: 'active' }],
+        todos: initialTodos,
         files: [],
         note: null,
         isUpdate: Boolean(directive.projectId),

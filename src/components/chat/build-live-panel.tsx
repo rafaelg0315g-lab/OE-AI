@@ -296,9 +296,11 @@ export function BuildLivePanel({ build }: { build: BuildLiveSnapshot }) {
         <div className="border-b border-white/10 px-4 py-3 md:border-b-0 md:border-r">
           <div className="mb-1.5 flex items-center gap-2">
             <span className="text-xs font-semibold uppercase tracking-wide text-white/50">Tareas</span>
-            <span className="rounded-full bg-white/10 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-white/60">
-              {doneCount}/{build.todos.length || 1}
-            </span>
+            {build.todos.length > 0 && (
+              <span className="rounded-full bg-white/10 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-white/60">
+                {doneCount}/{build.todos.length}
+              </span>
+            )}
           </div>
           <ul>
             <AnimatePresence initial={false}>

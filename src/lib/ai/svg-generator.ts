@@ -76,28 +76,7 @@ export async function generateSvgCode(subject: string): Promise<SvgOutcome> {
     }
   }
 
-  // 2) Gemini directo
-  if (process.env.GEMINI_API_KEY?.trim()) {
-    try {
-      const geminiAdapter = createGeminiDirectMiniAdapter()
-      const completion = await geminiAdapter.chat({
-        messages: [
-          { role: 'system' as const, content: SVG_SYSTEM },
-          { role: 'user' as const, content: userPrompt },
-        ],
-        providerModelId: GEMINI_DIRECT_ROUTE.providerModelId,
-      })
-      const code = extractSvgCode(completion.content)
-      if (code) {
-        return { code, providerId: 'gemini-direct', providerReportedModel: completion.providerReportedModel, latencyMs: completion.latencyMs }
-      }
-      errors.push('gemini: sin <svg> válido')
-    } catch (err) {
-      errors.push(`gemini: ${err instanceof Error ? err.message.slice(0, 100) : 'error'}`)
-    }
-  }
-
-  // 3) OpenRouter (primera ruta disponible y verificada si hay health checks)
+  // 2) OpenRouter (primera ruta disponible y verificada si hay health checks)
   if (process.env.OPENROUTER_API_KEY?.trim()) {
     try {
       const orRoutes = providerRegistry.availableRoutes().filter((r) => r.providerId === 'openrouter')
@@ -120,6 +99,51 @@ export async function generateSvgCode(subject: string): Promise<SvgOutcome> {
       }
     } catch (err) {
       errors.push(`openrouter: ${err instanceof Error ? err.message.slice(0, 100) : 'error'}`)
+    }
+  }
+
+  // 3) NVIDIA NIM (IAs de código abierto; thinking OFF en el adaptador)
+  if (process.env.NVIDIA_API_KEY?.trim()) {
+    try {
+      const nvRoutes = providerRegistry.availableRoutes().filter((r) => r.providerId === 'nvidia')
+      const nvAdapter = providerRegistry.get('nvidia')
+      if (nvAdapter && nvRoutes.length > 0) {
+        const completion = await nvAdapter.chat({
+          messages: [
+            { role: 'system' as const, content: SVG_SYSTEM },
+            { role: 'user' as const, content: userPrompt },
+          ],
+          providerModelId: nvRoutes[0].providerModelId,
+        })
+        const code = extractSvgCode(completion.content)
+        if (code) {
+          return { code, providerId: 'nvidia', providerReportedModel: completion.providerReportedModel, latencyMs: completion.latencyMs }
+        }
+        errors.push('nvidia: sin <svg> válido')
+      }
+    } catch (err) {
+      errors.push(`nvidia: ${err instanceof Error ? err.message.slice(0, 100) : 'error'}`)
+    }
+  }
+
+  // 4) Gemini directo (último: suele estar sin cuota free)
+  if (process.env.GEMINI_API_KEY?.trim()) {
+    try {
+      const geminiAdapter = createGeminiDirectMiniAdapter()
+      const completion = await geminiAdapter.chat({
+        messages: [
+          { role: 'system' as const, content: SVG_SYSTEM },
+          { role: 'user' as const, content: userPrompt },
+        ],
+        providerModelId: GEMINI_DIRECT_ROUTE.providerModelId,
+      })
+      const code = extractSvgCode(completion.content)
+      if (code) {
+        return { code, providerId: 'gemini-direct', providerReportedModel: completion.providerReportedModel, latencyMs: completion.latencyMs }
+      }
+      errors.push('gemini: sin <svg> válido')
+    } catch (err) {
+      errors.push(`gemini: ${err instanceof Error ? err.message.slice(0, 100) : 'error'}`)
     }
   }
 

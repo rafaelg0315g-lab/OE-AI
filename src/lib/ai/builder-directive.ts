@@ -24,6 +24,7 @@ B) CONSTRUCTOR DE APPS — para apps, herramientas, juegos o sistemas con lógic
 Reglas comunes:
 - "brief": mínimo 2 frases con tu diseño (funcionalidades/secciones, datos, endpoints si aplica y estética).
 - El constructor generará los archivos reales y el usuario los verá como tarjetas con descarga .zip y vista previa (webs).
+- FORMATO EXACTO (crítico): la directiva SIEMPRE es un bloque de código vallado con TRES BACKTICKS y la etiqueta oe-build u oe-web (\`\`\`oe-build … \`\`\`). NUNCA uses vallas ::: (ni :::oe-build ni :::oe-web): los bloques ::: son SOLO para :::plan/:::cards/:::gallery. Si usas ::: la app NO se construye.
 - NO escribas tú el código de la app/sitio ni añadas bloques de código aparte: solo las 1-2 frases + la directiva.
 - MODIFICACIONES (crítico): si abajo se lista un proyecto ya construido en esta conversación y la petición es un cambio/ajuste de ÉL (estilo, colores, secciones, textos, hero, añadir/quitar algo), es SIEMPRE una MODIFICACIÓN: emite la directiva del MISMO tipo que ese proyecto CON "projectId" (el id listado) y NO escribas código inline ni crees un proyecto nuevo. "Haz el hero más elegante" sobre una web listada = directiva oe-web con ese projectId.
 - NO uses directivas para preguntas sobre código, snippets, correcciones o explicaciones: solo para construir algo COMPLETO nuevo o modificar lo ya construido en esta conversación.
